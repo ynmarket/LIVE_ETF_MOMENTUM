@@ -64,3 +64,40 @@ jobs:
             reports/ETF_Momentum_Test_1_Report.xlsx
           if-no-files-found: warn
           retention-days: 30
+
+      # ── GitHub Pages: publish the SAME report, unchanged, as public/index.html ──
+      # These steps only run when everything above succeeded, so a broken or empty
+      # report is never published — the previous good report stays online instead.
+      - name: Prepare Pages site
+        run: |
+          mkdir -p public
+          cp reports/ETF_Momentum_Test_1_Report.html public/index.html
+          ls -l public/
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload Pages site
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: public
+
+  deploy-pages:
+    name: Deploy report to GitHub Pages
+    needs: run-strategy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
