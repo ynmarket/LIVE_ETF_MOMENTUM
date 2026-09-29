@@ -1,8 +1,22 @@
 name: Run ETF Strategy
 
-# Manual runs only for now: GitHub → Actions → Run ETF Strategy → Run workflow
 on:
+  # Manual: GitHub → Actions → Run ETF Strategy → Run workflow
   workflow_dispatch:
+    inputs:
+      telegram:
+        description: "Send Telegram messages for this run"
+        type: boolean
+        default: true
+  # Automatic (GitHub cron is UTC; times below are IST). Off the hour to avoid peak delays.
+  schedule:
+    - cron: "45 14 * * 1-5"   # 20:15 IST Mon–Fri — evening run after NSE close
+    - cron: "45 2 * * 2-6"    # 08:15 IST Tue–Sat — morning catch-up before market open
+
+# One run at a time: a scheduled and a manual run never overlap (the second one waits)
+concurrency:
+  group: run-etf-strategy
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -12,6 +26,8 @@ jobs:
     name: Run strategy and build report
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      problem: ${{ steps.diagnose.outputs.problem }}
 
     steps:
       - name: Checkout repository
@@ -23,27 +39,32 @@ jobs:
           python-version: "3.14"   # same version the strategy was tested with locally
 
       - name: Install dependencies
+        id: install
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt || { echo "::error title=Dependency problem::pip could not install requirements.txt"; exit 1; }
 
       - name: Run strategy
+        id: run
         env:
           PYTHONUNBUFFERED: "1"
         run: |
           set +e
           python ETF_Momentum_Test_1.py --force
           code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
           case $code in
             0) ;;
             2) echo "::error title=Data download problem::Too few ETFs downloaded from Yahoo Finance (see log above)" ;;
             3) echo "::error title=Excel generation problem::The Excel report could not be written (see log above)" ;;
             4) echo "::error title=HTML generation problem::The HTML report could not be written (see log above)" ;;
+            5) echo "::error title=Summary file problem::summary.json could not be written (see log above)" ;;
             *) echo "::error title=Strategy script failed::Python exited with code $code (see traceback above)" ;;
           esac
           exit $code
 
       - name: Verify reports
+        id: verify
         run: |
           html=reports/ETF_Momentum_Test_1_Report.html
           xlsx=reports/ETF_Momentum_Test_1_Report.xlsx
@@ -52,7 +73,17 @@ jobs:
           [ "$size" -gt 1000000 ] || { echo "::error title=HTML generation problem::$html is only $size bytes"; exit 1; }
           grep -q "Live Portfolio Dashboard" "$html" || { echo "::error title=HTML generation problem::dashboard title not found in $html"; exit 1; }
           test -f "$xlsx" || { echo "::error title=Excel generation problem::$xlsx was not created"; exit 1; }
+          python -c "import json; json.load(open('reports/summary.json'))" || { echo "::error title=Summary file problem::reports/summary.json missing or invalid"; exit 1; }
           ls -l reports/
+
+      # The summary currently on GitHub Pages = the last successful run. Used only so the
+      # Telegram step does not repeat alerts that were already sent.
+      - name: Fetch previously published summary
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"; repo="${GITHUB_REPOSITORY#*/}"
+          curl -fsSL --max-time 20 "https://${owner}.github.io/${repo}/summary.json?run=${GITHUB_RUN_ID}" \
+               -o reports/previous_summary.json \
+            || { echo "No previous summary published yet (first run?)"; rm -f reports/previous_summary.json; }
 
       - name: Upload report artifact
         if: always()   # keep whatever was generated, even when a step failed
@@ -62,8 +93,29 @@ jobs:
           path: |
             reports/ETF_Momentum_Test_1_Report.html
             reports/ETF_Momentum_Test_1_Report.xlsx
+            reports/summary.json
+            reports/previous_summary.json
           if-no-files-found: warn
           retention-days: 30
+
+      - name: Identify problem
+        id: diagnose
+        if: failure()
+        run: |
+          if [ "${{ steps.install.outcome }}" = "failure" ]; then p="Python dependency problem"
+          elif [ "${{ steps.run.outcome }}" = "failure" ]; then
+            case "${{ steps.run.outputs.code }}" in
+              2) p="Data download problem (Yahoo Finance)" ;;
+              3) p="Excel generation problem" ;;
+              4) p="HTML generation problem" ;;
+              5) p="Summary file problem" ;;
+              *) p="Strategy script error (exit code ${{ steps.run.outputs.code }})" ;;
+            esac
+          elif [ "${{ steps.verify.outcome }}" = "failure" ]; then p="Report check failed (file/HTML/Excel problem)"
+          else p="Workflow setup problem"
+          fi
+          echo "problem=$p" >> "$GITHUB_OUTPUT"
+          echo "::error title=Run failed::$p"
 
       # ── GitHub Pages: publish the SAME report, unchanged, as public/index.html ──
       # These steps only run when everything above succeeded, so a broken or empty
@@ -72,6 +124,7 @@ jobs:
         run: |
           mkdir -p public
           cp reports/ETF_Momentum_Test_1_Report.html public/index.html
+          cp reports/summary.json public/summary.json
           ls -l public/
 
       - name: Configure Pages
@@ -93,11 +146,66 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    concurrency:
-      group: pages
-      cancel-in-progress: false
 
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
+
+  notify:
+    name: Telegram alerts
+    needs: [run-strategy, deploy-pages]
+    # Scheduled runs always notify; manual runs only when the "telegram" box is ticked
+    if: always() && (github.event_name == 'schedule' || inputs.telegram)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Download report files
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: etf-momentum-report
+          path: reports
+
+      - name: Send Telegram message
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RUN_RESULT: ${{ needs.run-strategy.result }}
+          DEPLOY_RESULT: ${{ needs.deploy-pages.result }}
+          PROBLEM: ${{ needs.run-strategy.outputs.problem }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          if [ "$RUN_RESULT" != "success" ]; then
+            python3 notify_telegram.py --failure "${PROBLEM:-Workflow problem ($RUN_RESULT)}"
+          elif [ "$DEPLOY_RESULT" != "success" ]; then
+            python3 notify_telegram.py --failure "GitHub Pages deployment problem (the report was generated but not published)"
+          else
+            case "$SCHEDULE" in
+              "45 14 * * 1-5") mode=evening ;;
+              "45 2 * * 2-6")  mode=morning ;;
+              *)               mode=manual ;;
+            esac
+            prev=""; [ -f reports/previous_summary.json ] && prev="--previous reports/previous_summary.json"
+            python3 notify_telegram.py --summary reports/summary.json $prev --mode "$mode"
+          fi
+
+  # GitHub disables scheduled workflows after 60 days without repository activity.
+  # Re-enabling the workflow through the API on each scheduled run keeps it active
+  # without making any commits.
+  keepalive:
+    name: Keep schedule active
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable this workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/run_strategy.yml/enable"

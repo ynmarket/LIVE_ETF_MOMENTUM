@@ -27,6 +27,7 @@ for _p, _i in [("yfinance", "yfinance"), ("pandas", "pandas"), ("numpy", "numpy"
 
 import copy
 import html as htmlmod
+import json
 import math
 import os
 import warnings
@@ -1687,4 +1688,70 @@ except Exception as e:
     sys.exit(4)
 print(f"Saved: {HTML_PATH.name}")
 print(f"  → {HTML_PATH}")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SUMMARY JSON — machine-readable snapshot for notifications (reporting only)
+# ═════════════════════════════════════════════════════════════════════════════
+SUMMARY_PATH = OUTPUT_DIR / "summary.json"
+
+
+def _j(v):
+    """JSON-safe value: numpy → python, NaN → None, dates → ISO strings."""
+    if isinstance(v, dict):
+        return {str(k): _j(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_j(x) for x in v]
+    if isinstance(v, (np.bool_, bool)):
+        return bool(v)
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (float, np.floating)):
+        return None if math.isnan(v) else round(float(v), 4)
+    if hasattr(v, "isoformat"):
+        return v.isoformat()[:10]
+    return v
+
+
+summary = {
+    "generated_ist": now_ist().strftime("%Y-%m-%d %H:%M"),
+    "today_ist": str(TODAY.date()),
+    "as_of": str(AS_OF.date()),
+    "live_start": live_start_label,
+    "live_started": live_started,
+    "initial_capital": INITIAL_CAPITAL,
+    "value": live_value, "pnl": live_pnl, "ret_pct": live_ret,
+    "invested": invested, "cash": live_cash,
+    "n_positions": len(pos_rows), "n_hold": N_HOLD,
+    "max_dd_pct": live_max_dd, "closed_trades": n_lt,
+    "signal_status": signal_status,               # PENDING / READY / EXECUTED
+    "act_mode": act_mode,                         # preview / signal / executed
+    "last_signal_date": cur_signal.date() if cur_signal is not None else None,
+    "last_exec_date": cur_rebal.date() if cur_rebal is not None else None,
+    "next_signal_date": next_signal.date(), "next_signal_known": next_signal_known,
+    "next_exec_date": next_rebal.date(), "next_exec_confirmed": next_confirmed,
+    "near_stop_pct": NEAR_STOP_PCT,
+    "target_allocation": target_now,
+    "top6": cur_ranked[:N_HOLD],
+    "positions": [{k: r[k] for k in ("rank", "symbol", "qty", "entry_date", "entry_price", "price", "value",
+                                     "pnl", "pnl_pct", "hard_sl", "trail_sl", "dist_sl", "dist_trail",
+                                     "status", "price_date")} for r in pos_rows],
+    "actions": {k: [{f: a.get(f) for f in ("symbol", "rank", "qty", "price", "signal_price", "value",
+                                           "target", "reason", "pnl_pct")} for a in v]
+                for k, v in acts.items()},
+    "data": {
+        "status": data_status,
+        "etfs_loaded": len(SYMBOLS), "universe": len(UNIVERSE),
+        "stale": {str(d.date()): syms for d, syms in stale_groups.items()},
+        "stale_held": stale_held, "stale_signal": stale_signal, "stale_actions": stale_actions,
+        "market_delayed": market_delayed, "expected_latest": expected_latest.date(),
+        "excluded": dropped_info,
+    },
+}
+try:
+    SUMMARY_PATH.write_text(json.dumps(_j(summary), indent=2, ensure_ascii=False), encoding="utf-8")
+except Exception as e:
+    print(f"[SUMMARY ERROR] Could not write {SUMMARY_PATH}: {e}")
+    sys.exit(5)
+print(f"Saved: {SUMMARY_PATH.name}")
+
 open_report(HTML_PATH)
