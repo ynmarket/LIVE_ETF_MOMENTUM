@@ -1,0 +1,15 @@
+# Generated output (rebuilt on every run; published by GitHub Actions, not committed)
+reports/
+public/
+ETF_Momentum_Output/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+~$*.xlsx

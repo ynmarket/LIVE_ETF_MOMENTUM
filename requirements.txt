@@ -1,0 +1,7 @@
+# Packages imported by ETF_Momentum_Test_1.py — pinned to the versions tested locally
+# (Python 3.14) so GitHub Actions produces the same results for the same market data.
+yfinance==1.7.0
+pandas==3.0.6
+numpy==2.5.3
+openpyxl==3.1.5
+plotly==7.1.0

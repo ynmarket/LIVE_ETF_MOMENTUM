@@ -1,0 +1,66 @@
+name: Run ETF Strategy
+
+# Manual runs only for now: GitHub → Actions → Run ETF Strategy → Run workflow
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  run-strategy:
+    name: Run strategy and build report
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"   # same version the strategy was tested with locally
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt || { echo "::error title=Dependency problem::pip could not install requirements.txt"; exit 1; }
+
+      - name: Run strategy
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set +e
+          python ETF_Momentum_Test_1.py --force
+          code=$?
+          case $code in
+            0) ;;
+            2) echo "::error title=Data download problem::Too few ETFs downloaded from Yahoo Finance (see log above)" ;;
+            3) echo "::error title=Excel generation problem::The Excel report could not be written (see log above)" ;;
+            4) echo "::error title=HTML generation problem::The HTML report could not be written (see log above)" ;;
+            *) echo "::error title=Strategy script failed::Python exited with code $code (see traceback above)" ;;
+          esac
+          exit $code
+
+      - name: Verify reports
+        run: |
+          html=reports/ETF_Momentum_Test_1_Report.html
+          xlsx=reports/ETF_Momentum_Test_1_Report.xlsx
+          test -f "$html" || { echo "::error title=File/path problem::$html was not created"; exit 1; }
+          size=$(stat -c %s "$html")
+          [ "$size" -gt 1000000 ] || { echo "::error title=HTML generation problem::$html is only $size bytes"; exit 1; }
+          grep -q "Live Portfolio Dashboard" "$html" || { echo "::error title=HTML generation problem::dashboard title not found in $html"; exit 1; }
+          test -f "$xlsx" || { echo "::error title=Excel generation problem::$xlsx was not created"; exit 1; }
+          ls -l reports/
+
+      - name: Upload report artifact
+        if: always()   # keep whatever was generated, even when a step failed
+        uses: actions/upload-artifact@v7
+        with:
+          name: etf-momentum-report
+          path: |
+            reports/ETF_Momentum_Test_1_Report.html
+            reports/ETF_Momentum_Test_1_Report.xlsx
+          if-no-files-found: warn
+          retention-days: 30
