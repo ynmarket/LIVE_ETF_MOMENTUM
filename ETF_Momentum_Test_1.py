@@ -1593,6 +1593,7 @@ page_html = f"""<!DOCTYPE html>
  .b-buy {{ background:{GRN}; color:#0B2716; }} .b-hold {{ background:{BLUE}; color:#0B1F2E; }}
  .b-sell {{ background:{RD}; color:#fff; }} .b-risk {{ background:{AMBER}; color:#2B1D02; }}
  .b-skip {{ background:#7D6608; color:#fff; }} .b-out {{ background:#34495E; color:#D5DBDB; }}
+ table.rules td {{ white-space:normal; overflow-wrap:anywhere; }}   /* long rule text wraps on phones */
  table.rules td:first-child {{ color:{MUTED}; width:220px; }}
  details.hist {{ margin-top:40px; background:#122130; border-radius:10px; padding:10px 16px; opacity:.9; }}
  details.hist summary {{ cursor:pointer; color:{MUTED}; font-weight:600; }}
