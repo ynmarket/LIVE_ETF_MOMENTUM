@@ -1,0 +1,45 @@
+{
+  "live_start": "2026-10-01",
+  "initial_capital": 300000,
+  "entries": {
+    "2026-10": {
+      "entry_date": "2026-10-01",
+      "decided_from": "entry-day close (no entry-day run)",
+      "top6": [
+        "MONQ50",
+        "MAFANG",
+        "MON100",
+        "PHARMABEES",
+        "METALIETF",
+        "MODEFENCE"
+      ],
+      "buy": [
+        "MONQ50",
+        "MAFANG",
+        "MON100",
+        "PHARMABEES",
+        "METALIETF",
+        "MODEFENCE"
+      ],
+      "skip": [],
+      "sell": [],
+      "hold": [],
+      "scores": {
+        "MONQ50": 56.978,
+        "MAFANG": 38.907,
+        "MON100": 15.037,
+        "PHARMABEES": 9.183,
+        "METALIETF": 5.715,
+        "MODEFENCE": 5.467,
+        "HDFCSML250": 4.576,
+        "GOLDBEES": 3.899,
+        "SILVERBEES": 3.795,
+        "MIDSELIETF": 3.727
+      },
+      "saved": {
+        "at_ist": "2026-10-01 21:13",
+        "run_id": "36886424422"
+      }
+    }
+  }
+}
