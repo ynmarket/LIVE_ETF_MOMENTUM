@@ -42,6 +42,51 @@
         "at_ist": "2026-09-30 20:29",
         "run_id": "36733264520",
         "data": "49/49 ETFs priced on 2026-09-30 (seeded from the scheduled evening run)"
+      },
+      "execution_date": "2026-10-01",
+      "fills": {
+        "buy": [
+          {
+            "symbol": "MONQ50",
+            "qty": 258,
+            "price": 193.18
+          },
+          {
+            "symbol": "MAFANG",
+            "qty": 201,
+            "price": 248.21
+          },
+          {
+            "symbol": "MON100",
+            "qty": 155,
+            "price": 321.46
+          },
+          {
+            "symbol": "PHARMABEES",
+            "qty": 1844,
+            "price": 27.11
+          },
+          {
+            "symbol": "METALIETF",
+            "qty": 3965,
+            "price": 12.61
+          },
+          {
+            "symbol": "MODEFENCE",
+            "qty": 496,
+            "price": 100.71
+          }
+        ],
+        "sell": [],
+        "hold": [],
+        "cash_after": 501.4,
+        "value_after": 300000.0,
+        "basis": "execution-day close (strategy record)"
+      },
+      "fills_frozen": {
+        "at_ist": "2026-10-01 16:04",
+        "run_id": "36849960015",
+        "data": "closes on 2026-10-01 for all traded ETFs"
       }
     }
   }
