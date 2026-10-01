@@ -424,6 +424,9 @@ def rebalance(st, signal_date, execution_date, tag="", verbose=True, audit=False
         buy_dec = list(decisions["buy"])
         skip_dec = list(decisions["skip"])
     frozen_scores = (decisions or {}).get("scores", {})
+    if frozen_scores:                           # show the frozen rank/score, not a recomputed one
+        frozen_rank = {s: i for i, s in enumerate(sorted(frozen_scores, key=lambda k: -frozen_scores[k]), 1)}
+        rank_of = {**rank_of, **frozen_rank}
 
     # ═══ PHASE B — EXECUTION: prices on execution_date only ═══════════════════
     # Step 1: liquid interest on idle cash since the previous execution
@@ -432,9 +435,10 @@ def rebalance(st, signal_date, execution_date, tag="", verbose=True, audit=False
 
     def log(action, sym, exec_price, **kw):
         i = sc.get(sym, {})
+        score = frozen_scores.get(sym, i["score"] if i else None)
         st["log"].append(dict(
             date=ed.date(), signal_date=sd.date(), action=action, symbol=sym, category=CATEGORY[sym],
-            rank=rank_of.get(sym), score=round(i["score"], 3) if i else None,
+            rank=rank_of.get(sym), score=round(score, 3) if score is not None else None,
             signal_price=round(px(sym, sd), 4), dma200=round(i["dma"], 4) if i else None,
             price=round(exec_price, 4), source=source, **kw))
 
