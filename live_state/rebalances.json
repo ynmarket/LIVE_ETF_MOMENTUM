@@ -1,0 +1,48 @@
+{
+  "live_start": "2026-10-01",
+  "initial_capital": 300000,
+  "rebalances": {
+    "2026-10": {
+      "signal_date": "2026-09-30",
+      "expected_execution_date": "2026-10-01",
+      "signal": {
+        "top6": [
+          "MONQ50",
+          "MAFANG",
+          "MON100",
+          "PHARMABEES",
+          "METALIETF",
+          "MODEFENCE"
+        ],
+        "buy": [
+          "MONQ50",
+          "MAFANG",
+          "MON100",
+          "PHARMABEES",
+          "METALIETF",
+          "MODEFENCE"
+        ],
+        "skip": [],
+        "sell": [],
+        "hold": [],
+        "scores": {
+          "MONQ50": 58.2214,
+          "MAFANG": 36.1097,
+          "MON100": 15.4069,
+          "PHARMABEES": 10.181,
+          "METALIETF": 8.2694,
+          "MODEFENCE": 6.6646,
+          "HDFCSML250": 6.0886,
+          "SILVERBEES": 5.7295,
+          "MOREALTY": 5.6411,
+          "INTERNET": 5.5758
+        }
+      },
+      "signal_frozen": {
+        "at_ist": "2026-09-30 20:29",
+        "run_id": "36733264520",
+        "data": "49/49 ETFs priced on 2026-09-30 (seeded from the scheduled evening run)"
+      }
+    }
+  }
+}

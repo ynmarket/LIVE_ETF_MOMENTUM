@@ -3,6 +3,8 @@ notify_telegram.py — Telegram alerts for the ETF momentum live dashboard.
 
 Reads reports/summary.json (written by ETF_Momentum_Test_1.py) and sends:
   🔔 final / provisional rebalance signal   (signal day, status READY)
+  🛒 order plan                             (execution day, manual run during market hours)
+  ⛔ signal data incomplete                 (signal-day prices missing — do not trade)
   ✅ rebalance executed                      (execution day, status EXECUTED)
   ⚠️ exit risk                               (stop hit, near a stop, or outside the top 6)
   ⚠️ data delayed                            (held / top-6 / action ETFs without the latest price)
@@ -15,6 +17,7 @@ Standard library only. Never prints the bot token.
 
 Usage:
   python notify_telegram.py --summary reports/summary.json --previous reports/previous_summary.json --mode evening
+  (--mode morning is kept for compatibility; no morning schedule is used any more)
   python notify_telegram.py --failure "Data download problem"
   python notify_telegram.py --summary reports/summary.json --mode manual --dry-run
 Env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (GitHub secrets); GITHUB_* set by Actions.
@@ -112,8 +115,8 @@ def msg_summary(s, prev):
     lines += ["", f"🗓 Next: signal {d(s['next_signal_date'])}{exp(s['next_signal_known'])} → "
                   f"execute {d(s['next_exec_date'])}{exp(s['next_exec_confirmed'])} · <b>{s['signal_status']}</b>"]
     if s["signal_status"] == "PENDING" and s["next_signal_date"] == s["today_ist"]:
-        lines.append("ℹ️ Today is signal day, but today's close is not in the data yet — "
-                     "the final signal will be checked again at 08:15 IST.")
+        lines.append("ℹ️ Today is signal day, but Yahoo does not have today's close yet — "
+                     "re-run the workflow later tonight to get the final signal.")
     data = s["data"]
     if data["status"] == "CURRENT":
         lines.append(f"📡 Data: ✓ current ({data['etfs_loaded']}/{data['universe']} ETFs)")
@@ -156,9 +159,53 @@ def msg_signal(s):
     lines += ["", "Quantities use the signal-day close as an estimate; the strategy fills at the "
                   "execution-day close."]
     if prov:
-        lines.append("⚠️ Some prices are delayed — this signal may still change. It will be re-checked at "
-                     "08:15 IST, or re-run the workflow from GitHub Actions.")
+        lines.append("⚠️ Some prices are delayed — this signal may still change. Re-run the workflow from "
+                     "GitHub Actions later to confirm it.")
+    if s.get("signal_source") == "frozen":
+        lines.append("🔒 Signal frozen from complete signal-day data — later Yahoo gaps cannot change it.")
     return "\n".join(lines) + footer()
+
+
+def msg_order_plan(s):
+    a = s["actions"]
+    month = month_name(s["next_exec_date"])
+    lines = [f"🛒 <b>ORDER PLAN — {month} rebalance, execute TODAY before close</b>",
+             f"{d(s['next_exec_date'])} · live prices at {esc(s['live_quote_time'])} IST · <b>not executed yet</b>",
+             f"Signal: {d(s['next_signal_date'])} close"
+             + (" (🔒 frozen from complete data)" if s.get("signal_source") == "frozen" else ""), ""]
+    if a["BUY"]:
+        lines.append("🟢 <b>BUY</b>")
+        lines += [f"• {esc(x['symbol'])} — <b>{x['qty']}</b> units × {num(x['price'])} = {inr(x['value'])} "
+                  f"(target {inr(x['target'])})" for x in a["BUY"]]
+    if a["SELL"]:
+        lines.append("🔴 <b>SELL</b>")
+        lines += [f"• {esc(x['symbol'])} — all {x['qty']} units ({esc(x['reason'])}) ≈ {inr(x['value'])}"
+                  for x in a["SELL"]]
+    if a["HOLD"]:
+        lines.append("⚪ <b>HOLD</b> (no action): " + ", ".join(esc(x["symbol"]) for x in a["HOLD"]))
+    if a["SKIP"]:
+        lines.append("🟡 <b>SKIP</b>: " + ", ".join(f"{esc(x['symbol'])} ({esc(x['reason'])})" for x in a["SKIP"]))
+    if not any(a.values()):
+        lines.append("No trades today.")
+    if s.get("order_plan_missing_quotes"):
+        lines.append("⚠️ No live quote for " + ", ".join(esc(x) for x in s["order_plan_missing_quotes"])
+                     + " — last close used.")
+    lines += ["", "Yahoo prices can lag — use your broker's live price: quantity = target ÷ price, rounded "
+                  "down. The strategy records the trade at today's close after 16:00 IST."]
+    return "\n".join(lines) + footer()
+
+
+def msg_incomplete(s):
+    miss = s.get("signal_missing", [])
+    lines = ["⛔ <b>SIGNAL DATA INCOMPLETE — do not trade on it</b>",
+             f"{len(miss)} ETFs have no {d(s['as_of'])} price on Yahoo: " + ", ".join(esc(x) for x in miss),
+             "The ranking would use older prices for them and may be wrong.",
+             "Re-run the workflow later; the scheduled 20:15 IST run re-checks automatically."]
+    return "\n".join(lines) + footer()
+
+
+def key_incomplete(s):
+    return (s["as_of"], s["signal_status"], sorted(s.get("signal_missing", [])))
 
 
 def msg_executed(s):
@@ -198,7 +245,8 @@ def msg_exit_risk(s):
 
 def data_affected(s):
     data = s["data"]
-    return bool(data["stale_held"] or data["stale_signal"] or data["stale_actions"] or data["market_delayed"])
+    signal_hit = (data["stale_signal"] or data["stale_actions"]) and s.get("signal_source") != "frozen"
+    return bool(data["stale_held"] or signal_hit or data["market_delayed"])
 
 
 def msg_data(s):
@@ -214,10 +262,12 @@ def msg_data(s):
     if data["stale_held"]:
         lines.append("Held: " + ", ".join(esc(x) for x in data["stale_held"]))
     sig = sorted(set(data["stale_signal"]) | set(data["stale_actions"]))
-    if sig:
+    if s.get("signal_source") == "frozen":
+        lines.append("Signal not affected — 🔒 frozen from complete signal-day data.")
+    elif sig:
         lines.append("Signal / actions: " + ", ".join(esc(x) for x in sig))
-    if s["signal_status"] == "READY":
-        lines.append("<b>Do not act on the signal yet</b> — it will be re-checked at 08:15 IST.")
+    if s["signal_status"] in ("READY", "INCOMPLETE") and s.get("signal_source") != "frozen":
+        lines.append("<b>Do not act on the signal yet</b> — re-run the workflow later once Yahoo has updated.")
     return "\n".join(lines) + footer()
 
 
@@ -265,7 +315,12 @@ def build_messages(s, prev, mode):
             return True
 
     msgs = []
-    if s["signal_status"] == "READY" and new(key_signal):
+    act_mode = s.get("act_mode")
+    if act_mode == "orderplan":
+        msgs.append(msg_order_plan(s))              # manual pre-close run: always send
+    elif act_mode == "incomplete" and new(key_incomplete):
+        msgs.append(msg_incomplete(s))
+    elif s["signal_status"] == "READY" and new(key_signal):
         msgs.append(msg_signal(s))
     if s["signal_status"] == "EXECUTED" and new(key_executed):
         msgs.append(msg_executed(s))

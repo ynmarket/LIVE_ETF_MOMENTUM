@@ -8,10 +8,11 @@ on:
         description: "Send Telegram messages for this run"
         type: boolean
         default: true
-  # Automatic (GitHub cron is UTC; times below are IST). Off the hour to avoid peak delays.
+  # Automatic (GitHub cron is UTC; time below is IST). Off the hour to avoid peak delays.
+  # Evening only: a morning run was removed because Yahoo withdraws the previous day's prices
+  # overnight for many ETFs, which produced misleading signals.
   schedule:
     - cron: "45 14 * * 1-5"   # 20:15 IST Mon–Fri — evening run after NSE close
-    - cron: "45 2 * * 2-6"    # 08:15 IST Tue–Sat — morning catch-up before market open
 
 # One run at a time: a scheduled and a manual run never overlap (the second one waits)
 concurrency:
@@ -26,6 +27,8 @@ jobs:
     name: Run strategy and build report
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write          # to commit live_state/rebalances.json (frozen live rebalances)
     outputs:
       problem: ${{ steps.diagnose.outputs.problem }}
 
@@ -76,6 +79,23 @@ jobs:
           python -c "import json; json.load(open('reports/summary.json'))" || { echo "::error title=Summary file problem::reports/summary.json missing or invalid"; exit 1; }
           ls -l reports/
 
+      # Signals / fills computed from COMPLETE data are frozen by the script; commit them so every
+      # later run replays them instead of recomputing from Yahoo (which can withdraw past prices).
+      - name: Save frozen rebalances
+        id: freeze
+        run: |
+          if [ -n "$(git status --porcelain -- live_state)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add live_state/rebalances.json
+            git commit -m "Freeze live rebalance data ($(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M') IST)"
+            git pull --rebase origin main
+            git push origin HEAD:main
+            echo "Frozen rebalances committed."
+          else
+            echo "No new frozen rebalance."
+          fi
+
       # The summary currently on GitHub Pages = the last successful run. Used only so the
       # Telegram step does not repeat alerts that were already sent.
       - name: Fetch previously published summary
@@ -112,6 +132,7 @@ jobs:
               *) p="Strategy script error (exit code ${{ steps.run.outputs.code }})" ;;
             esac
           elif [ "${{ steps.verify.outcome }}" = "failure" ]; then p="Report check failed (file/HTML/Excel problem)"
+          elif [ "${{ steps.freeze.outcome }}" = "failure" ]; then p="Could not save frozen rebalance data (git push)"
           else p="Workflow setup problem"
           fi
           echo "problem=$p" >> "$GITHUB_OUTPUT"
@@ -187,7 +208,6 @@ jobs:
           else
             case "$SCHEDULE" in
               "45 14 * * 1-5") mode=evening ;;
-              "45 2 * * 2-6")  mode=morning ;;
               *)               mode=manual ;;
             esac
             prev=""; [ -f reports/previous_summary.json ] && prev="--previous reports/previous_summary.json"
