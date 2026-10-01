@@ -2,10 +2,9 @@
 notify_telegram.py — Telegram alerts for the ETF momentum live dashboard.
 
 Reads reports/summary.json (written by ETF_Momentum_Test_1.py) and sends:
-  🔔 final / provisional rebalance signal   (signal day, status READY)
-  🛒 order plan                             (execution day, manual run during market hours)
-  ⛔ signal data incomplete                 (signal-day prices missing — do not trade)
-  ✅ rebalance executed                      (execution day, status EXECUTED)
+  🛒 order plan                             (entry day, run during market hours: live prices)
+  ⛔ data incomplete                        (live prices missing on the entry day — do not trade)
+  ✅ rebalance recorded                      (entry day's close, status EXECUTED)
   ⚠️ exit risk                               (stop hit, near a stop, or outside the top 6)
   ⚠️ data delayed                            (held / top-6 / action ETFs without the latest price)
   📊 daily summary                           (evening and manual runs)
@@ -109,14 +108,16 @@ def msg_summary(s, prev):
             lines.append(f"• {esc(p['symbol'])}  {pct(p['pnl_pct'])}  {inr(p['value'])}{flag}")
     else:
         buys = ", ".join(esc(a["symbol"]) for a in s["actions"]["BUY"]) or "none"
+        basis = ("order plan, live prices" if s.get("act_mode") in ("orderplan", "incomplete")
+                 else "preview from the latest close")
         lines += [f"⏳ Live portfolio starts <b>{esc(s['live_start'])}</b> with {inr(s['initial_capital'])}.",
-                  f"Preview of initial buys (latest close): {buys}"]
+                  f"Initial buys ({basis}): {buys}"]
     exp = lambda known: "" if known else " (expected)"
-    lines += ["", f"🗓 Next: signal {d(s['next_signal_date'])}{exp(s['next_signal_known'])} → "
-                  f"execute {d(s['next_exec_date'])}{exp(s['next_exec_confirmed'])} · <b>{s['signal_status']}</b>"]
-    if s["signal_status"] == "PENDING" and s["next_signal_date"] == s["today_ist"]:
-        lines.append("ℹ️ Today is signal day, but Yahoo does not have today's close yet — "
-                     "re-run the workflow later tonight to get the final signal.")
+    lines += ["", f"🗓 Next entry day (signal + execution): {d(s['next_exec_date'])}"
+                  f"{exp(s['next_exec_confirmed'])} · <b>{s['signal_status']}</b>"]
+    if s["signal_status"] == "ENTRY DAY":
+        lines.append("ℹ️ Today is the entry day — run the workflow during market hours (~14:00 IST) "
+                     "for the order plan from live prices.")
     data = s["data"]
     if data["status"] == "CURRENT":
         lines.append(f"📡 Data: ✓ current ({data['etfs_loaded']}/{data['universe']} ETFs)")
@@ -128,51 +129,12 @@ def msg_summary(s, prev):
     return "\n".join(lines) + footer()
 
 
-def _signal_provisional(s):
-    data = s["data"]
-    return bool(data["stale_signal"] or data["stale_actions"] or data["market_delayed"])
-
-
-def msg_signal(s):
-    a = s["actions"]
-    prov = _signal_provisional(s)
-    month = month_name(s["next_exec_date"])
-    head = (f"⏳ <b>PROVISIONAL {month} signal — data incomplete</b>" if prov
-            else f"🔔 <b>FINAL {month} signal</b>")
-    lines = [head,
-             f"Signal close: {d(s['as_of'])} → execute on <b>{d(s['next_exec_date'])}</b> at close", ""]
-    if a["BUY"]:
-        lines.append("🟢 <b>BUY</b>")
-        lines += [f"• {esc(x['symbol'])} #{x['rank']} — ~{x['qty']} units, target {inr(x['target'])} "
-                  f"(est. @ {num(x['price'])})" for x in a["BUY"]]
-    if a["SELL"]:
-        lines.append("🔴 <b>SELL</b>")
-        lines += [f"• {esc(x['symbol'])} — {esc(x['reason'])} · {x['qty']} units · P&amp;L {pct(x['pnl_pct'])}"
-                  for x in a["SELL"]]
-    if a["HOLD"]:
-        lines.append("⚪ <b>HOLD</b>: " + ", ".join(esc(x["symbol"]) for x in a["HOLD"]))
-    if a["SKIP"]:
-        lines.append("🟡 <b>SKIP</b>: " + ", ".join(f"{esc(x['symbol'])} #{x['rank']} ({esc(x['reason'])})"
-                                                   for x in a["SKIP"]))
-    if not any(a.values()):
-        lines.append("No trades.")
-    lines += ["", "Quantities use the signal-day close as an estimate; the strategy fills at the "
-                  "execution-day close."]
-    if prov:
-        lines.append("⚠️ Some prices are delayed — this signal may still change. Re-run the workflow from "
-                     "GitHub Actions later to confirm it.")
-    if s.get("signal_source") == "frozen":
-        lines.append("🔒 Signal frozen from complete signal-day data — later Yahoo gaps cannot change it.")
-    return "\n".join(lines) + footer()
-
-
 def msg_order_plan(s):
     a = s["actions"]
     month = month_name(s["next_exec_date"])
-    lines = [f"🛒 <b>ORDER PLAN — {month} rebalance, execute TODAY before close</b>",
-             f"{d(s['next_exec_date'])} · live prices at {esc(s['live_quote_time'])} IST · <b>not executed yet</b>",
-             f"Signal: {d(s['next_signal_date'])} close"
-             + (" (🔒 frozen from complete data)" if s.get("signal_source") == "frozen" else ""), ""]
+    lines = [f"🛒 <b>ORDER PLAN — {month} entry day, execute TODAY before close</b>",
+             f"{d(s['next_exec_date'])} · signal and quantities from live prices at "
+             f"{esc(s['live_quote_time'])} IST · <b>not recorded yet</b>", ""]
     if a["BUY"]:
         lines.append("🟢 <b>BUY</b>")
         lines += [f"• {esc(x['symbol'])} — <b>{x['qty']}</b> units × {num(x['price'])} = {inr(x['value'])} "
@@ -191,16 +153,16 @@ def msg_order_plan(s):
         lines.append("⚠️ No live quote for " + ", ".join(esc(x) for x in s["order_plan_missing_quotes"])
                      + " — last close used.")
     lines += ["", "Yahoo prices can lag — use your broker's live price: quantity = target ÷ price, rounded "
-                  "down. The strategy records the trade at today's close after 16:00 IST."]
+                  "down. This choice is saved and recorded at today's close by the 20:15 evening run."]
     return "\n".join(lines) + footer()
 
 
 def msg_incomplete(s):
     miss = s.get("signal_missing", [])
-    lines = ["⛔ <b>SIGNAL DATA INCOMPLETE — do not trade on it</b>",
-             f"{len(miss)} ETFs have no {d(s['as_of'])} price on Yahoo: " + ", ".join(esc(x) for x in miss),
-             "The ranking would use older prices for them and may be wrong.",
-             "Re-run the workflow later; the scheduled 20:15 IST run re-checks automatically."]
+    lines = ["⛔ <b>DATA INCOMPLETE — do not trade on this order plan</b>",
+             f"{len(miss)} ETFs have no live price on Yahoo: " + ", ".join(esc(x) for x in miss),
+             "The ranking would use yesterday's close for them and may be wrong.",
+             "Re-run the workflow in a few minutes."]
     return "\n".join(lines) + footer()
 
 
@@ -211,8 +173,9 @@ def key_incomplete(s):
 def msg_executed(s):
     a = s["actions"]
     month = month_name(s["last_exec_date"])
-    lines = [f"✅ <b>{month} rebalance executed</b>",
-             f"Executed {d(s['last_exec_date'])} · signal {d(s['last_signal_date'])}", ""]
+    lines = [f"✅ <b>{month} entry-day rebalance recorded</b>",
+             f"Entry day {d(s['last_exec_date'])} · fills at that day's close · "
+             f"decision: {esc(s.get('signal_source', ''))}", ""]
     for x in a["BUY"]:
         lines.append(f"🟢 BUY {esc(x['symbol'])} {x['qty']} × {num(x['price'])} = {inr(x['value'])}")
     for x in a["SELL"]:
@@ -238,14 +201,13 @@ def msg_exit_risk(s):
         lines.append(f"• <b>{esc(p['symbol'])}</b> {num(p['price'])} — {esc(why)}")
         lines.append(f"   Hard SL {num(p['hard_sl'])} ({pct(p['dist_sl'], False)} away) · "
                      f"Trail {num(p['trail_sl'])} ({pct(p['dist_trail'], False)} away)")
-    lines += ["", f"Exits happen only at the monthly rebalance: signal {d(s['next_signal_date'])} → "
-                  f"execute {d(s['next_exec_date'])}."]
+    lines += ["", f"Exits happen only on the entry day: {d(s['next_exec_date'])}."]
     return "\n".join(lines) + footer()
 
 
 def data_affected(s):
     data = s["data"]
-    signal_hit = (data["stale_signal"] or data["stale_actions"]) and s.get("signal_source") != "frozen"
+    signal_hit = data["stale_signal"] or data["stale_actions"]
     return bool(data["stale_held"] or signal_hit or data["market_delayed"])
 
 
@@ -262,12 +224,10 @@ def msg_data(s):
     if data["stale_held"]:
         lines.append("Held: " + ", ".join(esc(x) for x in data["stale_held"]))
     sig = sorted(set(data["stale_signal"]) | set(data["stale_actions"]))
-    if s.get("signal_source") == "frozen":
-        lines.append("Signal not affected — 🔒 frozen from complete signal-day data.")
-    elif sig:
-        lines.append("Signal / actions: " + ", ".join(esc(x) for x in sig))
-    if s["signal_status"] in ("READY", "INCOMPLETE") and s.get("signal_source") != "frozen":
-        lines.append("<b>Do not act on the signal yet</b> — re-run the workflow later once Yahoo has updated.")
+    if sig:
+        lines.append("Ranking / actions: " + ", ".join(esc(x) for x in sig))
+    if s["signal_status"] in ("ORDER PLAN", "INCOMPLETE"):
+        lines.append("<b>Check before trading</b> — re-run the workflow once Yahoo has updated.")
     return "\n".join(lines) + footer()
 
 
@@ -281,14 +241,6 @@ def msg_failure(problem):
 
 
 # ── de-duplication keys (what makes an alert "new") ──────────────────────────
-def key_signal(s):
-    a = s["actions"]
-    return (s["signal_status"], s["next_exec_date"], _signal_provisional(s),
-            sorted((x["symbol"], x["qty"]) for x in a["BUY"]),
-            sorted((x["symbol"], x["reason"]) for x in a["SELL"]),
-            sorted(x["symbol"] for x in a["SKIP"]))
-
-
 def key_executed(s):
     return (s["signal_status"], s["last_exec_date"])
 
@@ -320,8 +272,6 @@ def build_messages(s, prev, mode):
         msgs.append(msg_order_plan(s))              # manual pre-close run: always send
     elif act_mode == "incomplete" and new(key_incomplete):
         msgs.append(msg_incomplete(s))
-    elif s["signal_status"] == "READY" and new(key_signal):
-        msgs.append(msg_signal(s))
     if s["signal_status"] == "EXECUTED" and new(key_executed):
         msgs.append(msg_executed(s))
     if risky_positions(s) and new(key_risk):

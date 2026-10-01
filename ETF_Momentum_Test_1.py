@@ -248,21 +248,13 @@ def month_first_days(dates):
     return list(s.groupby([dates.year, dates.month]).first())
 
 
-def prev_trading_day(d):
-    """Immediately preceding date in the actual market calendar (never calendar-day arithmetic)."""
-    i = cal.get_loc(d)
-    if i == 0:
-        raise ValueError(f"No trading day before {d.date()} in the price data")
-    return cal[i - 1]
-
-
 def rebalance_schedule(execution_dates):
-    """[(signal_date, execution_date)]: signal = previous trading day's close,
-    execution = first trading day of the month."""
-    return [(prev_trading_day(e), e) for e in execution_dates]
+    """[(signal_date, execution_date)]: the FIRST TRADING DAY of each month (the entry day) is both
+    the signal day and the execution day — signal and fills use that day's close."""
+    return [(e, e) for e in execution_dates]
 
 
-REBAL_DATES = month_first_days(cal_bt)          # execution dates (first trading day of each month)
+REBAL_DATES = month_first_days(cal_bt)          # entry days (first trading day of each month)
 REBAL_SCHEDULE = rebalance_schedule(REBAL_DATES)
 
 
@@ -271,62 +263,58 @@ def missing_on(d, symbols=None):
     return [s for s in (SYMBOLS if symbols is None else symbols) if d not in hist_idx[s]]
 
 
-# ── Frozen live rebalances (live_state/rebalances.json) ──────────────────────
-# Yahoo sometimes withdraws a day's prices for many ETFs (seen for Sep 28 and Sep 30, 2026).
-# Because the live portfolio is rebuilt from history on every run, such a gap could silently
-# rewrite a past signal. Once a signal (and later its fills) is computed from COMPLETE data, it
-# is frozen here by the GitHub workflow and replayed by every later run. Rules are unchanged.
-FROZEN_PATH = BASE_DIR / "live_state" / "rebalances.json"
+# ── Saved entry-day decisions (live_state/entry_decisions.json) ─────────────
+# On the entry day the user runs the workflow during market hours (~14:00 IST). The ETFs chosen in
+# that run (from that moment's live prices) are saved here — the last market-hours run of the day
+# wins — and the evening run records them at the entry day's close. If no entry-day run happened,
+# the first run with complete entry-day closes decides from the close and saves that decision.
+# Only the decision (which ETFs to buy / sell / hold / skip) is saved; prices always come from Yahoo.
+ENTRY_PATH = BASE_DIR / "live_state" / "entry_decisions.json"
 
 
-def load_frozen():
+def load_entries():
     try:
-        doc = json.loads(FROZEN_PATH.read_text(encoding="utf-8"))
+        doc = json.loads(ENTRY_PATH.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {"live_start": LIVE_START_DATE, "initial_capital": INITIAL_CAPITAL, "rebalances": {}}, {}
+        return {}
     except ValueError as e:
-        print(f"  [warn] {FROZEN_PATH.name} is not valid JSON ({e}) — ignoring frozen rebalances")
-        return {"live_start": LIVE_START_DATE, "initial_capital": INITIAL_CAPITAL, "rebalances": {}}, {}
+        print(f"  [warn] {ENTRY_PATH.name} is not valid JSON ({e}) — ignoring saved entry decisions")
+        return {}
     if doc.get("live_start") != LIVE_START_DATE or doc.get("initial_capital") != INITIAL_CAPITAL:
-        print(f"  [warn] {FROZEN_PATH.name} belongs to live start {doc.get('live_start')} / capital "
+        print(f"  [warn] {ENTRY_PATH.name} belongs to live start {doc.get('live_start')} / capital "
               f"{doc.get('initial_capital')} — ignored for LIVE_START_DATE {LIVE_START_DATE}")
-        return {"live_start": LIVE_START_DATE, "initial_capital": INITIAL_CAPITAL, "rebalances": {}}, {}
-    return doc, doc.get("rebalances", {})
+        return {}
+    return doc.get("entries", {})
 
 
-def frozen_decisions(rec):
-    if not rec or not rec.get("signal"):
+def entry_decisions(rec):
+    """Saved entry-day decision → the `decisions` argument of rebalance()."""
+    if not rec:
         return None
-    sig = rec["signal"]
-    return {"top6": sig["top6"], "buy": sig["buy"], "skip": sig["skip"],
-            "sell": [(x["symbol"], x["reason"]) for x in sig["sell"]], "scores": sig.get("scores", {})}
+    return {"top6": rec["top6"], "buy": rec["buy"], "skip": rec["skip"],
+            "sell": [(x["symbol"], x["reason"]) for x in rec["sell"]], "scores": rec.get("scores", {})}
 
 
-def frozen_fills(rec):
-    if not rec or not rec.get("fills"):
-        return None
-    f = rec["fills"]
-    return {"BUY": {x["symbol"]: (x["qty"], x["price"]) for x in f["buy"]},
-            "SELL": {x["symbol"]: x["price"] for x in f["sell"]}}
-
-
-frozen_doc, FROZEN = load_frozen()
-if FROZEN:
-    print(f"Frozen live rebalances: " + ", ".join(
-        f"{m} ({'signal+fills' if r.get('fills') else 'signal'})" for m, r in sorted(FROZEN.items())))
+ENTRIES = load_entries()
+if ENTRIES:
+    print("Saved entry-day decisions: " + ", ".join(
+        f"{m} ({r['decided_from']})" for m, r in sorted(ENTRIES.items())))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
 # SIGNAL HELPERS
 # ═════════════════════════════════════════════════════════════════════════════
-def compute_scores(d):
-    """Momentum score + 200-DMA for every ETF with >= MIN_HISTORY rows up to date d."""
+def compute_scores(d, extra=None):
+    """Momentum score + 200-DMA for every ETF with >= MIN_HISTORY rows up to date d.
+    extra = {symbol: live price}: appended as the entry day's price (entry-day order plan only)."""
     out = {}
     for sym in SYMBOLS:
         n = hist_idx[sym].searchsorted(d, side="right")
-        if n < MIN_HISTORY:
-            continue
         v = hist_vals[sym][:n]
+        if extra and sym in extra:
+            v = np.append(v, extra[sym])
+        if len(v) < MIN_HISTORY:
+            continue
         today = v[-1]
         rets = [(today - v[-1 - lb]) / v[-1 - lb] * 100 for lb in LB]
         score = sum(r * w for r, w in zip(rets, WEIGHTS))
@@ -350,48 +338,39 @@ def new_state(capital):
 
 
 def rebalance(st, signal_date, execution_date, tag="", verbose=True, audit=False, preview=False,
-              decisions=None, fills=None, exec_prices=None):
-    """One monthly rebalance, in two strictly separated phases:
+              decisions=None, live=None):
+    """One monthly rebalance on the ENTRY DAY (first trading day of the month), in two phases:
 
-    PHASE A — SIGNAL (uses ONLY data on or before signal_date = previous trading day):
+    PHASE A — SIGNAL (data up to and including the entry day's price):
         momentum, 200-DMA, ranking, top 6, stop/rotation exits, entry gate → decisions
-    PHASE B — EXECUTION (uses ONLY prices on execution_date = first trading day of month):
+    PHASE B — EXECUTION (the same entry day's price):
         sells, buys, entry/exit prices, cash, portfolio value
 
-    preview=True is only for the dashboard's "what if the signal were taken on the latest close"
-    view: execution prices are then estimates, and the state passed in must be a copy.
-
-    Live-portfolio data integrity (no rule changes):
-      decisions   — a FROZEN signal (computed earlier from complete signal-day data) replaces the
-                    Phase A recomputation, so later Yahoo data gaps cannot rewrite a past signal.
-      fills       — FROZEN fills {"BUY": {sym: (qty, price)}, "SELL": {sym: price}} replay the
-                    recorded execution exactly.
-      exec_prices — live prices for the pre-close ORDER PLAN (preview only).
+    preview=True is only for dashboard previews; the state passed in must be a copy.
+      decisions — a SAVED entry-day decision (the ETFs chosen in the user's entry-day run) replaces
+                  the Phase A recomputation, so the record matches what was decided that day.
+      live      — {symbol: live price} for the entry-day ORDER PLAN during market hours: used as the
+                  entry day's price for the signal and for the quantities (preview only).
     """
     sd, ed = signal_date, execution_date
     if not preview:
-        assert sd < ed and sd == prev_trading_day(ed), "signal date must be the previous trading day"
+        assert sd == ed, "signal and execution happen on the same entry day"
     positions = st["positions"]   # sym -> dict(qty, entry_date, entry_price, peak, cur, score_entry, ...)
-    source = "frozen-fills" if fills else ("frozen-signal" if decisions else "computed")
+    source = "saved-decision" if decisions else "computed"
 
     def xpx(sym):
-        """Execution price: frozen fill → live order-plan price → execution-date close."""
-        if fills:
-            if sym in fills.get("BUY", {}):
-                return float(fills["BUY"][sym][1])
-            if sym in fills.get("SELL", {}):
-                return float(fills["SELL"][sym])
-        if exec_prices and sym in exec_prices:
-            return float(exec_prices[sym])
+        """Entry-day price: live quote (order plan) → entry-day close."""
+        if live and sym in live:
+            return float(live[sym])
         return px(sym, ed)
 
-    # ═══ PHASE A — SIGNAL: data <= signal_date only ═══════════════════════════
-    # Mark held positions at the signal-date close and ratchet the peak with it
+    # ═══ PHASE A — SIGNAL: data up to the entry day's price ═════════════════════
+    # Mark held positions at the entry-day price and ratchet the peak with it
     for sym, p in positions.items():
-        p["sig"] = px(sym, sd)
+        p["sig"] = xpx(sym)
         if p["sig"] > p["peak"]:
             p["peak"] = p["sig"]
-    sc = compute_scores(sd)                     # momentum + 200-DMA through sd
+    sc = compute_scores(sd, extra=live)         # momentum + 200-DMA through the entry day
     ranked = sorted(sc.keys(), key=lambda k: sc[k]["score"], reverse=True)
     rank_of = {s: i for i, s in enumerate(ranked, 1)}
     top = ranked[:N_HOLD]
@@ -416,17 +395,17 @@ def rebalance(st, signal_date, execution_date, tag="", verbose=True, audit=False
         else:
             skip_dec.append(sym)
 
-    if decisions:                               # frozen signal replaces the recomputed decisions
+    if decisions:                               # saved entry-day decision replaces the recomputation
         top = list(decisions["top6"])
         sell_dec = [(s, r) for s, r in decisions["sell"] if s in positions]
         sold = {s for s, _ in sell_dec}
         hold_dec = [s for s in positions if s not in sold]
         buy_dec = list(decisions["buy"])
         skip_dec = list(decisions["skip"])
-    frozen_scores = (decisions or {}).get("scores", {})
-    if frozen_scores:                           # show the frozen rank/score, not a recomputed one
-        frozen_rank = {s: i for i, s in enumerate(sorted(frozen_scores, key=lambda k: -frozen_scores[k]), 1)}
-        rank_of = {**rank_of, **frozen_rank}
+    saved_scores = (decisions or {}).get("scores", {})
+    if saved_scores:                            # show the saved rank/score, not a recomputed one
+        saved_rank = {s: i for i, s in enumerate(sorted(saved_scores, key=lambda k: -saved_scores[k]), 1)}
+        rank_of = {**rank_of, **saved_rank}
 
     # ═══ PHASE B — EXECUTION: prices on execution_date only ═══════════════════
     # Step 1: liquid interest on idle cash since the previous execution
@@ -435,11 +414,11 @@ def rebalance(st, signal_date, execution_date, tag="", verbose=True, audit=False
 
     def log(action, sym, exec_price, **kw):
         i = sc.get(sym, {})
-        score = frozen_scores.get(sym, i["score"] if i else None)
+        score = saved_scores.get(sym, i["score"] if i else None)
         st["log"].append(dict(
             date=ed.date(), signal_date=sd.date(), action=action, symbol=sym, category=CATEGORY[sym],
             rank=rank_of.get(sym), score=round(score, 3) if score is not None else None,
-            signal_price=round(px(sym, sd), 4), dma200=round(i["dma"], 4) if i else None,
+            signal_price=round(xpx(sym), 4), dma200=round(i["dma"], 4) if i else None,
             price=round(exec_price, 4), source=source, **kw))
 
     for sym, reason in sell_dec:
@@ -479,16 +458,13 @@ def rebalance(st, signal_date, execution_date, tag="", verbose=True, audit=False
                 reason="Below 200 DMA (slot left empty)", pnl_pct=None)
         elif sym in buy_dec:
             xp = xpx(sym)
-            if fills and sym in fills.get("BUY", {}):
-                qty = int(fills["BUY"][sym][0])               # replay the recorded fill exactly
-            else:
-                qty = math.floor(min(alloc, st["cash"]) / xp)   # never let cash go negative
+            qty = math.floor(min(alloc, st["cash"]) / xp)   # never let cash go negative
             if qty <= 0:
                 log("SKIP", sym, xp, qty=0, value=0.0, target=round(alloc, 2),
                     reason="Insufficient cash", pnl_pct=None)
                 continue
             st["cash"] -= qty * xp
-            score_entry = frozen_scores.get(sym, sc.get(sym, {}).get("score", float("nan")))
+            score_entry = saved_scores.get(sym, sc.get(sym, {}).get("score", float("nan")))
             positions[sym] = dict(qty=qty, entry_date=ed, entry_price=xp, peak=xp, cur=xp,
                                   score_entry=score_entry, entry_signal_date=sd)
             log("BUY", sym, xp, qty=qty, value=round(qty * xp, 2), target=round(alloc, 2),
@@ -518,12 +494,10 @@ def rebalance(st, signal_date, execution_date, tag="", verbose=True, audit=False
         mine = [a for a in st["log"] if a["date"] == ed.date() and a["signal_date"] == sd.date()]
         print("=" * 60)
         print(f"{tag}MONTHLY REBALANCE")
-        print(f"Signal Date    : {sd.date()}")
-        print(f"Execution Date : {ed.date()}")
+        print(f"Entry Day      : {ed.date()}  (signal + execution)")
         print("=" * 60)
-        print(f"Signal generated from data available through: {sd.date()}"
-              + {"frozen-fills": "  [FROZEN signal + fills replayed]",
-                 "frozen-signal": "  [FROZEN signal replayed]"}.get(source, ""))
+        print(f"Signal from data up to the {ed.date()} close"
+              + ("  [saved entry-day decision replayed]" if source == "saved-decision" else ""))
         for act in ("BUY", "SELL", "HOLD", "SKIP"):
             items = [a for a in mine if a["action"] == act]
             print(f"{act}:" + ("" if items else " none"))
@@ -533,23 +507,21 @@ def rebalance(st, signal_date, execution_date, tag="", verbose=True, audit=False
         print("Execution prices:")
         for a in mine:
             if a["action"] in ("BUY", "SELL"):
-                print(f"  {a['symbol']} {a['action']} → ₹{a['price']:,.2f} on {ed.date()} "
-                      f"(signal close ₹{a['signal_price']:,.2f} on {sd.date()})")
+                print(f"  {a['symbol']} {a['action']} → ₹{a['price']:,.2f} on {ed.date()}")
         print(f"After execution: Held {len(positions)} | Cash ₹{st['cash']:,.0f} | Portfolio ₹{pv:,.0f}\n")
     elif verbose:
-        print(f"{tag}signal {sd.date()} → exec {ed.date()} | Held: {len(positions)} | "
+        print(f"{tag}entry {ed.date()} | Held: {len(positions)} | "
               f"Cash: ₹{st['cash']:,.0f} | Portfolio: ₹{pv:,.0f}")
     st["prev_d"], st["prev_signal"], st["prev_val"] = ed, sd, pv
 
 
-def run_strategy(schedule, capital, tag, verbose=True, audit=False, frozen=None):
-    """Deterministic simulation: fresh capital, then every (signal_date, execution_date) in order.
-    `frozen` (live portfolio only): {"YYYY-MM": record} — frozen signals/fills are replayed."""
+def run_strategy(schedule, capital, tag, verbose=True, audit=False, entries=None):
+    """Deterministic simulation: fresh capital, then every entry day in order.
+    `entries` (live portfolio only): {"YYYY-MM": saved entry-day decision} — replayed when present."""
     st = new_state(capital)
     for sd, ed in schedule:
-        rec = (frozen or {}).get(ed.strftime("%Y-%m"))
-        rebalance(st, sd, ed, tag, verbose, audit,
-                  decisions=frozen_decisions(rec), fills=frozen_fills(rec))
+        rec = (entries or {}).get(ed.strftime("%Y-%m"))
+        rebalance(st, sd, ed, tag, verbose, audit, decisions=entry_decisions(rec))
     return st
 
 
@@ -599,7 +571,7 @@ def open_positions_df(res, as_of):
 # RUN HISTORICAL BACKTEST (internal reference only — never feeds the live portfolio)
 # ═════════════════════════════════════════════════════════════════════════════
 print(f"\nHistorical backtest: {REBAL_DATES[0].date()} → {LAST_DATE.date()} ({len(REBAL_DATES)} rebalances, "
-      f"signal = previous trading day close, execution = first trading day)")
+      f"signal and execution on the first trading day's close)")
 bt = run_strategy(REBAL_SCHEDULE, INITIAL_CAPITAL, tag="")
 daily_df = daily_equity(bt, LAST_DATE)
 
@@ -608,10 +580,9 @@ daily_df = daily_equity(bt, LAST_DATE)
 # ═════════════════════════════════════════════════════════════════════════════
 # The live portfolio is rebuilt deterministically on every run:
 #   new_state(INITIAL_CAPITAL)
-#   → initialisation: signal on the trading day before LIVE_START_DATE's first session,
-#     executed on the first trading day on/after LIVE_START_DATE
-#   → every later month: signal on previous trading day, execute on first trading day
-#   → today's state.
+#   → initialisation on the first trading day on/after LIVE_START_DATE (signal + execution)
+#   → every later month: first trading day = entry day (signal + execution)
+#   → today's state. Saved entry-day decisions are replayed (live_state/entry_decisions.json).
 # Nothing is taken from the historical backtest `bt`.
 live = None
 live_daily = None
@@ -624,9 +595,9 @@ if len(_cal_live) == 0:
 else:
     live_schedule = rebalance_schedule(month_first_days(_cal_live))   # first = initialisation
     live_init_date = live_schedule[0][1]
-    print(f"\nLive portfolio: initialised {live_init_date.date()} (signal {live_schedule[0][0].date()}) "
+    print(f"\nLive portfolio: initialised {live_init_date.date()} (entry day: signal + execution) "
           f"with ₹{INITIAL_CAPITAL:,.0f} ({len(live_schedule)} live rebalance(s))\n")
-    live = run_strategy(live_schedule, INITIAL_CAPITAL, tag="[LIVE] ", audit=True, frozen=FROZEN)
+    live = run_strategy(live_schedule, INITIAL_CAPITAL, tag="[LIVE] ", audit=True, entries=ENTRIES)
     live_daily = daily_equity(live, DATA_LAST)
 
 
@@ -643,47 +614,38 @@ def _independent_score(sym, upto):
 
 
 def validate_no_lookahead(st, label, show):
-    """Check every rebalance of `st`; print a detailed proof for the rebalance at index `show`."""
+    """Check every rebalance of `st`: signal and execution on the same entry day, the signal uses no
+    data after that day's close, and every fill is at that day's close. Prints one example."""
     n_checked = 0
     for m in st["monthly"]:
         sd, ed = m["signal_date"], m["rebal_date"]
-        assert sd < ed and sd == prev_trading_day(ed), f"{label}: bad signal date {sd} for {ed}"
+        assert sd == ed and ed in cal, f"{label}: signal {sd} and execution {ed} must be the same entry day"
         rows = [r for r in st["scores"] if r["rebal_date"] == ed.date()]
-        for r in rows:                                       # every score/DMA/rank input <= signal date
-            s, dma, sp = _independent_score(r["symbol"], sd)
+        for r in rows:                                       # every score/DMA/rank input <= entry day
+            s, dma, sp = _independent_score(r["symbol"], ed)
             assert abs(s - r["score"]) < 1e-3 and abs(dma - r["dma200"]) < 1e-3 and abs(sp - r["price"]) < 1e-3, \
-                f"{label}: {r['symbol']} signal on {ed.date()} does not match data <= {sd.date()}"
-        for a in st["log"]:                                   # every fill at the execution-day price
-            # (frozen fills replay the price recorded at the time, even if Yahoo revised it since)
-            if a["date"] == ed.date() and a["action"] in ("BUY", "SELL") and a.get("source") != "frozen-fills":
-                assert abs(a["price"] - px(a["symbol"], ed)) < 1e-3, f"{label}: {a['symbol']} fill not at {ed.date()} price"
-                assert abs(a["signal_price"] - px(a["symbol"], sd)) < 1e-3
+                f"{label}: {r['symbol']} signal on {ed.date()} does not match data <= {ed.date()}"
+        for a in st["log"]:                                   # every fill at the entry-day close
+            if a["date"] == ed.date() and a["action"] in ("BUY", "SELL"):
+                assert abs(a["price"] - px(a["symbol"], ed)) < 1e-3, f"{label}: {a['symbol']} fill not at {ed.date()} close"
         n_checked += 1
     for t in st["trades"]:
-        assert t["entry_signal_date"] < t["entry_date"] and t["exit_signal_date"] < t["exit_date"]
+        assert t["entry_signal_date"] == t["entry_date"] and t["exit_signal_date"] == t["exit_date"]
 
     m = st["monthly"][show]
-    sd, ed = m["signal_date"], m["rebal_date"]
+    ed = m["rebal_date"]
     rows = sorted((r for r in st["scores"] if r["rebal_date"] == ed.date()), key=lambda r: r["rank"])
-    top_sig = [r["symbol"] for r in rows[:N_HOLD]]
-    alt = {s: _independent_score(s, ed) for s in SYMBOLS}     # what a same-day (look-ahead) signal would say
-    top_alt = [s for s, _ in sorted(((s, v[0]) for s, v in alt.items() if v), key=lambda x: -x[1])[:N_HOLD]]
     print("\n" + "=" * 72)
-    print(f"LOOK-AHEAD VALIDATION — {label}: {n_checked} rebalances checked, all passed")
+    print(f"LOOK-AHEAD VALIDATION — {label}: {n_checked} entry days checked, all passed")
     print("=" * 72)
-    print(f"Example rebalance    : signal {sd.date()} ({sd:%a}) → execution {ed.date()} ({ed:%a})")
-    print(f"Previous trading day : {prev_trading_day(ed).date()}  (from market calendar)")
-    print(f"Top 6 from data <= {sd.date()} : {', '.join(top_sig)}")
-    print(f"Top 6 IF {ed.date()} close were used (NOT used): {', '.join(top_alt)}")
-    print(f"{'Symbol':<11}{'Action':<7}{'Score@signal':>13}{'Score@exec(unused)':>20}"
-          f"{'Signal close':>14}{'Exec price':>12}")
+    print(f"Example entry day : {ed.date()} ({ed:%a}) — signal and execution on this day's close")
+    print(f"Top 6 from data <= {ed.date()} : {', '.join(r['symbol'] for r in rows[:N_HOLD])}")
+    print(f"{'Symbol':<11}{'Action':<7}{'Score':>10}{'Close':>12}{'Fill':>12}")
     for a in (x for x in st["log"] if x["date"] == ed.date() and x["action"] in ("BUY", "SELL", "HOLD")):
-        s_sig = _independent_score(a["symbol"], sd)[0]
-        s_ex = alt[a["symbol"]][0] if alt.get(a["symbol"]) else float("nan")
-        print(f"{a['symbol']:<11}{a['action']:<7}{s_sig:>13.3f}{s_ex:>20.3f}"
-              f"{a['signal_price']:>14.2f}{a['price']:>12.2f}")
-    print("✓ momentum, 200-DMA, ranking and stop/entry decisions use data <= signal date")
-    print("✓ every BUY/SELL price equals the execution-date close\n")
+        print(f"{a['symbol']:<11}{a['action']:<7}{(a['score'] or float('nan')):>10.3f}"
+              f"{px(a['symbol'], ed):>12.2f}{a['price']:>12.2f}")
+    print("✓ momentum, 200-DMA, ranking and stop/entry decisions use data up to the entry-day close only")
+    print("✓ every BUY/SELL price equals the entry-day close\n")
 
 
 validate_no_lookahead(bt, "HISTORICAL BACKTEST", show=-1)
@@ -790,17 +752,68 @@ metrics = [
 # ═════════════════════════════════════════════════════════════════════════════
 # LIVE DASHBOARD STATE (everything below the historical block is live-only)
 # ═════════════════════════════════════════════════════════════════════════════
-AS_OF = DATA_LAST                      # latest market date; no data after this is used anywhere
+AS_OF = DATA_LAST                      # latest close in the data (today's live bar is never a close)
 TODAY = pd.Timestamp(now_ist().date())
 NEAR_STOP_PCT = 5.0                    # reporting only: flag positions within 5% of a stop
 
-cur_sc = compute_scores(AS_OF)
+live_started = live is not None
+live_state = live if live_started else new_state(INITIAL_CAPITAL)
+
+
+# ── Entry-day timing: the 1st trading day of each month is signal AND execution day ──
+# Future sessions are not in the price data, so a future entry day is an estimate that skips
+# weekends only (exchange holidays are unknown in advance). Past/present dates come from the data.
+def _first_weekday_on_or_after(d):
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+def _last_weekday_before(d):
+    d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+cur_rebal = live["prev_d"] if live_started else None            # last recorded entry day
+cur_signal = cur_rebal                                           # signal day = entry day
+executed_today = live_started and cur_rebal == AS_OF
+
+next_anchor = live_ts if not live_started else (AS_OF + pd.offsets.MonthBegin(1)).normalize()
+_later = cal[cal >= next_anchor]
+if len(_later):                                   # (only possible if data runs past the anchor)
+    next_rebal, next_confirmed = _later[0], True
+else:
+    next_rebal, next_confirmed = _first_weekday_on_or_after(next_anchor), False
+days_to_next = (next_rebal - TODAY).days
+next_month = next_rebal.strftime("%Y-%m")
+entry_today = bool(next_rebal == TODAY and not executed_today)
+if entry_today and MARKET_HOURS:
+    next_confirmed = True                         # the market is open today, so today IS a trading day
+next_signal, next_signal_known = next_rebal, next_confirmed     # signal and execution: same entry day
+
+# Entry-day ORDER PLAN: during market hours on the entry day, today's live Yahoo price is used as the
+# entry day's price for the signal (momentum, 200-DMA, ranking, stops) and for the quantities.
+order_plan = bool(MARKET_HOURS and entry_today)
+live_quote_time = _now.strftime("%H:%M") if MARKET_HOURS else None
+live_sc = compute_scores(AS_OF, extra=live_quotes) if order_plan else None
+
+# Live-price completeness: ETFs without a live quote would be ranked on yesterday's close. Up to 2
+# gaps are tolerated only for ETFs that are neither held nor in the live top 10.
+QUOTE_GAP_TOLERANCE = 2
+signal_missing = [s for s in SYMBOLS if s not in live_quotes] if order_plan else []
+_live_top10 = sorted(live_sc, key=lambda k: live_sc[k]["score"], reverse=True)[:10] if live_sc else []
+_key_syms = set(live_state["positions"]) | set(_live_top10)
+signal_incomplete = bool(order_plan and signal_missing
+                         and (len(signal_missing) > QUOTE_GAP_TOLERANCE or _key_syms & set(signal_missing)))
+
+# Ranking shown on the dashboard: the entry-day live ranking during the order plan, else latest close
+cur_sc = live_sc if order_plan else compute_scores(AS_OF)
 cur_ranked = sorted(cur_sc, key=lambda k: cur_sc[k]["score"], reverse=True)
 cur_rank = {s: i for i, s in enumerate(cur_ranked, 1)}
 cur_top = set(cur_ranked[:N_HOLD])
 
-live_started = live is not None
-live_state = live if live_started else new_state(INITIAL_CAPITAL)
 live_cash = float(live_daily["cash"].iloc[-1]) if live_started else float(INITIAL_CAPITAL)
 
 # Current live positions
@@ -841,103 +854,45 @@ pos_rows.sort(key=lambda r: (r["rank"] is None, r["rank"] or 0))
 live_pnl = live_value - INITIAL_CAPITAL
 live_ret = live_pnl / INITIAL_CAPITAL * 100
 
-# ── Rebalance timing: signal = previous trading day close, execution = first trading day ──
-# Future sessions are not in the price data, so future dates are estimates that skip weekends
-# only (exchange holidays are unknown in advance). Past/present dates come from the calendar.
-def _first_weekday_on_or_after(d):
-    while d.weekday() >= 5:
-        d += timedelta(days=1)
-    return d
-
-
-def _last_weekday_before(d):
-    d -= timedelta(days=1)
-    while d.weekday() >= 5:
-        d -= timedelta(days=1)
-    return d
-
-
-cur_rebal = live["prev_d"] if live_started else None            # last executed execution date
-cur_signal = live["prev_signal"] if live_started else None      # ... and its signal date
-executed_today = live_started and cur_rebal == AS_OF
-
-next_anchor = live_ts if not live_started else (AS_OF + pd.offsets.MonthBegin(1)).normalize()
-_later = cal[cal >= next_anchor]
-if len(_later):                                   # (only possible if data runs past the anchor)
-    next_rebal, next_confirmed = _later[0], True
-else:
-    next_rebal, next_confirmed = _first_weekday_on_or_after(next_anchor), False
-_est_signal = _last_weekday_before(next_rebal)
-if next_confirmed:
-    next_signal, next_signal_known = prev_trading_day(next_rebal), True
-elif AS_OF >= _est_signal:                        # latest close IS the last session before execution
-    next_signal, next_signal_known = AS_OF, True
-else:
-    next_signal, next_signal_known = _est_signal, False
-days_to_next = (next_rebal - TODAY).days
-
-# A signal already frozen (from complete data) for the next execution month is final and is used
-# as-is, even if Yahoo has since withdrawn some signal-day prices.
-next_month = next_rebal.strftime("%Y-%m")
-frozen_next = FROZEN.get(next_month) if not executed_today else None
-frozen_next_dec = frozen_decisions(frozen_next)
-if frozen_next_dec:
-    next_signal, next_signal_known = pd.Timestamp(frozen_next["signal_date"]), True
-
-# Signal-day completeness: a signal computed while ETFs are missing their signal-day price is
-# NOT trusted (it would silently use older prices). Up to 2 gaps are tolerated only for ETFs that
-# are neither held nor ranked in the top 10.
-SIGNAL_GAP_TOLERANCE = 2
-signal_missing = missing_on(AS_OF) if (next_signal_known and not executed_today) else []
-_key_syms = set(live_state["positions"]) | set(cur_ranked[:10])
-signal_incomplete = bool(
-    next_signal_known and not executed_today and frozen_next_dec is None and signal_missing
-    and (len(signal_missing) > SIGNAL_GAP_TOLERANCE or _key_syms & set(signal_missing)))
-
-# Pre-close ORDER PLAN: market is open on the execution day → yesterday's (final) signal, sized
-# with today's live prices. Never recorded as executed; the close-based record is made after 16:00.
-order_plan = bool(MARKET_HOURS and next_rebal == TODAY and next_signal_known and not signal_incomplete)
-live_quote_time = _now.strftime("%H:%M") if MARKET_HOURS else None
-
 if executed_today:
     signal_status = "EXECUTED"
 elif signal_incomplete:
     signal_status = "INCOMPLETE"
-elif next_signal_known:
-    signal_status = "READY"
+elif order_plan:
+    signal_status = "ORDER PLAN"
+elif entry_today:
+    signal_status = "ENTRY DAY"
 else:
     signal_status = "PENDING"
 
-# Actions: the executed rebalance (today), or the SAME engine run on a copy with the latest close
-# as signal. For READY/PENDING the execution prices are estimates (latest close); for the order
-# plan they are today's live prices.
+# Actions: the recorded entry-day rebalance (today's close), or the SAME engine run on a copy —
+# with today's live prices during the entry-day order plan, otherwise a preview from the latest close.
 if executed_today:
     act_mode = "executed"
     act_log = [a for a in live["log"] if a["date"] == AS_OF.date()]
 else:
-    act_mode = ("orderplan" if order_plan else "incomplete" if signal_status == "INCOMPLETE"
-                else "signal" if signal_status == "READY" else "preview")
+    act_mode = "incomplete" if signal_incomplete else "orderplan" if order_plan else "preview"
     _pv = copy.deepcopy(live_state)
-    rebalance(_pv, AS_OF, AS_OF, verbose=False, preview=True, decisions=frozen_next_dec,
-              exec_prices=live_quotes if order_plan else None)
+    rebalance(_pv, AS_OF, AS_OF, verbose=False, preview=True, live=live_quotes if order_plan else None)
     act_log = [a for a in _pv["log"] if a["date"] == AS_OF.date() and a["signal_date"] == AS_OF.date()]
 acts = {k: [a for a in act_log if a["action"] == k] for k in ("BUY", "HOLD", "SELL", "SKIP")}
-signal_source = ("frozen" if frozen_next_dec and act_mode in ("signal", "orderplan") else
-                 "frozen" if act_mode == "executed" and FROZEN.get(AS_OF.strftime("%Y-%m")) else "computed")
+_rec_now = ENTRIES.get(AS_OF.strftime("%Y-%m")) if executed_today else None
+signal_source = ("live" if act_mode in ("orderplan", "incomplete")
+                 else (_rec_now or {}).get("decided_from", "entry-day close") if executed_today else "latest close")
 order_plan_missing_quotes = [a["symbol"] for a in act_log
                              if order_plan and a["action"] in ("BUY", "SELL", "HOLD") and a["symbol"] not in live_quotes]
 if MARKET_HOURS:
     print(f"\n  [MARKET OPEN] Today's ({TODAY.date()}) prices are live quotes, not closes — excluded from "
           f"the price history; data shown up to {AS_OF.date()}.")
-if order_plan:
-    print(f"  [ORDER PLAN] Execution day: signal {next_signal.date()} ({signal_source}), "
-          f"sized with live prices at {live_quote_time} IST — NOT executed")
+if order_plan and not signal_incomplete:
+    print(f"  [ORDER PLAN] Entry day {TODAY.date()}: signal and quantities from live prices at "
+          f"{live_quote_time} IST — NOT recorded until today's close")
 if signal_incomplete:
-    print(f"  [SIGNAL INCOMPLETE] {len(signal_missing)} ETFs have no {AS_OF.date()} price: "
-          f"{', '.join(signal_missing)} — do not trade on this signal")
+    print(f"  [DATA INCOMPLETE] {len(signal_missing)} ETFs have no live price: "
+          f"{', '.join(signal_missing)} — do not trade on this order plan")
 
 # ═════════════════════════════════════════════════════════════════════════════
-# FREEZE completed live rebalances (GitHub Actions only; the workflow commits the file)
+# SAVE ENTRY-DAY DECISIONS (GitHub Actions only; the workflow commits the file)
 # ═════════════════════════════════════════════════════════════════════════════
 def _decisions_from_log(entries, top6, score_map):
     return {
@@ -951,61 +906,45 @@ def _decisions_from_log(entries, top6, score_map):
     }
 
 
-freeze_notes = []
-_frozen_new = copy.deepcopy(FROZEN)
+entry_notes = []
+_entries_new = copy.deepcopy(ENTRIES)
 _stamp = {"at_ist": now_ist().strftime("%Y-%m-%d %H:%M"), "run_id": os.environ.get("GITHUB_RUN_ID")}
-# 1) Signal for the upcoming execution month: only from a COMPLETE signal day (zero gaps)
-if (signal_status == "READY" and frozen_next_dec is None and not missing_on(AS_OF)
-        and next_month not in _frozen_new):
-    _frozen_new[next_month] = {
-        "signal_date": str(AS_OF.date()), "expected_execution_date": str(next_rebal.date()),
-        "signal": _decisions_from_log(act_log, cur_ranked[:N_HOLD],
-                                      {s: cur_sc[s]["score"] for s in cur_ranked[:10]}),
-        "signal_frozen": {**_stamp, "data": f"{len(SYMBOLS)}/{len(SYMBOLS)} ETFs priced on {AS_OF.date()}"},
+# 1) Entry-day run during market hours: save the ETFs chosen now (the last such run of the day wins)
+if order_plan and not signal_incomplete:
+    _entries_new[next_month] = {
+        "entry_date": str(TODAY.date()),
+        "decided_from": f"entry-day run, live prices {live_quote_time} IST",
+        **_decisions_from_log(act_log, cur_ranked[:N_HOLD], {s: cur_sc[s]["score"] for s in cur_ranked[:10]}),
+        "saved": _stamp,
     }
-    freeze_notes.append(f"signal for {next_month} (signal date {AS_OF.date()})")
-# 2) Fills of executed live rebalances: execution-day closes present for every traded/held ETF
+    entry_notes.append(f"{next_month} decision from live prices at {live_quote_time} IST")
+# 2) Entry day recorded at the close without an entry-day run: save the close-based decision
+#    (only when every ETF has that day's close, so a Yahoo gap is never saved)
 if live_started:
     for m in live["monthly"]:
-        sd, ed = m["signal_date"], m["rebal_date"]
+        ed = m["rebal_date"]
         month = ed.strftime("%Y-%m")
-        rec = _frozen_new.get(month, {})
-        if rec.get("fills"):
+        if month in _entries_new or missing_on(ed):
             continue
         entries = [a for a in live["log"] if a["date"] == ed.date()]
-        traded = {a["symbol"] for a in entries if a["action"] in ("BUY", "SELL", "HOLD")}
-        if missing_on(ed, list(traded & set(SYMBOLS))):
-            continue                                  # execution-day closes not all available yet
-        if not rec.get("signal") and missing_on(sd):
-            continue                                  # signal day was incomplete — never freeze it
-        if not rec.get("signal"):
-            rows = sorted((r for r in live["scores"] if r["rebal_date"] == ed.date()), key=lambda r: r["rank"])
-            rec = {"signal_date": str(sd.date()), "expected_execution_date": str(ed.date()),
-                   "signal": _decisions_from_log(entries, [r["symbol"] for r in rows[:N_HOLD]],
-                                                 {r["symbol"]: r["score"] for r in rows[:10]}),
-                   "signal_frozen": {**_stamp, "data": f"complete on {sd.date()}"}}
-        rec["execution_date"] = str(ed.date())
-        rec["fills"] = {
-            "buy": [{"symbol": a["symbol"], "qty": int(a["qty"]), "price": a["price"]}
-                    for a in entries if a["action"] == "BUY"],
-            "sell": [{"symbol": a["symbol"], "qty": int(a["qty"]), "price": a["price"], "reason": a["reason"]}
-                     for a in entries if a["action"] == "SELL"],
-            "hold": [a["symbol"] for a in entries if a["action"] == "HOLD"],
-            "cash_after": m["cash"], "value_after": m["portfolio_value"],
-            "basis": "execution-day close (strategy record)",
+        rows = sorted((r for r in live["scores"] if r["rebal_date"] == ed.date()), key=lambda r: r["rank"])
+        _entries_new[month] = {
+            "entry_date": str(ed.date()),
+            "decided_from": "entry-day close (no entry-day run)",
+            **_decisions_from_log(entries, [r["symbol"] for r in rows[:N_HOLD]],
+                                  {r["symbol"]: r["score"] for r in rows[:10]}),
+            "saved": _stamp,
         }
-        rec["fills_frozen"] = {**_stamp, "data": f"closes on {ed.date()} for all traded ETFs"}
-        _frozen_new[month] = rec
-        freeze_notes.append(f"fills for {month} (executed {ed.date()})")
-if freeze_notes:
+        entry_notes.append(f"{month} decision from the {ed.date()} close")
+if entry_notes:
     if IN_CI:
-        FROZEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-        FROZEN_PATH.write_text(json.dumps({"live_start": LIVE_START_DATE, "initial_capital": INITIAL_CAPITAL,
-                                           "rebalances": dict(sorted(_frozen_new.items()))},
-                                          indent=2, ensure_ascii=False), encoding="utf-8")
-        print("  [FREEZE] Saved " + "; ".join(freeze_notes) + f" → {FROZEN_PATH.relative_to(BASE_DIR)}")
+        ENTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ENTRY_PATH.write_text(json.dumps({"live_start": LIVE_START_DATE, "initial_capital": INITIAL_CAPITAL,
+                                          "entries": dict(sorted(_entries_new.items()))},
+                                         indent=2, ensure_ascii=False), encoding="utf-8")
+        print("  [SAVED] " + "; ".join(entry_notes) + f" → {ENTRY_PATH.relative_to(BASE_DIR)}")
     else:
-        print("  [FREEZE] Would freeze " + "; ".join(freeze_notes) + " (only GitHub Actions writes the file)")
+        print("  [SAVE] Would save " + "; ".join(entry_notes) + " (only GitHub Actions writes the file)")
 
 # ── Data freshness (reporting only — no calculation is changed) ─────────────
 # An ETF is "delayed" when Yahoo has no row for it on the latest market date (AS_OF);
@@ -1105,10 +1044,9 @@ else:
 print(f"  Actions ({act_mode}): BUY {len(acts['BUY'])} | HOLD {len(acts['HOLD'])} | "
       f"SELL {len(acts['SELL'])} | SKIP {len(acts['SKIP'])}")
 if live_started:
-    print(f"  Last rebalance  signal {cur_signal.date()} → executed {cur_rebal.date()}")
+    print(f"  Last entry day  {cur_rebal.date()} (signal + execution)")
 print(f"  Latest data     {AS_OF.date()}")
-print(f"  Next signal     {next_signal.date()}{'' if next_signal_known else ' (expected)'}   "
-      f"Next execution {next_rebal.date()}{'' if next_confirmed else ' (expected)'}   Status {signal_status}")
+print(f"  Next entry day  {next_rebal.date()}{'' if next_confirmed else ' (expected)'}   Status {signal_status}")
 print(f"  [Historical reference {first_d.date()}→{LAST_DATE.date()}: CAGR {cagr:.2f}% | "
       f"MaxDD {max_dd_daily:.2f}% | Sharpe {sharpe:.2f}]")
 print("═" * 60)
@@ -1133,13 +1071,13 @@ live_summary_df = pd.DataFrame([
     ("Closed Trades", n_lt),
     ("Win Rate %", round(lt_stats["wr"], 2) if lt_stats["wr"] is not None else "n/a"),
     ("Realised P&L", round(lt_stats["realised"], 2)),
-    ("Last Rebalance Signal Date", str(cur_signal.date()) if cur_signal is not None else "n/a"),
-    ("Last Rebalance Execution Date", str(cur_rebal.date()) if cur_rebal is not None else "n/a"),
+    ("Last Entry Day", str(cur_rebal.date()) if cur_rebal is not None else "n/a"),
     ("Latest Market Data", str(AS_OF.date())),
-    ("Next Signal Date", f"{next_signal.date()}{'' if next_signal_known else ' (expected)'}"),
-    ("Next Execution Date", f"{next_rebal.date()}{'' if next_confirmed else ' (expected)'}"),
-    ("Signal Status", signal_status),
-    ("Methodology", "Signal = previous trading day close; execution = first trading day close"),
+    ("Next Entry Day", f"{next_rebal.date()}{'' if next_confirmed else ' (expected)'}"),
+    ("Status", signal_status),
+    ("Decision source", signal_source),
+    ("Methodology", "Entry day = first trading day of the month: signal and execution at that day's close "
+                    "(order plan from live prices during market hours)"),
     ("Data Status", data_status + ("" if data_ok else
                                    f" — {len(stale)} of {len(SYMBOLS)} ETFs without a {AS_OF.date()} price"
                                    + (f"; market data older than expected {expected_latest.date()}"
@@ -1418,27 +1356,17 @@ else:
     if stale_held:
         _lines.append(f"⚠ <b>Your positions affected:</b> {', '.join(stale_held)} — values, P&L and stop "
                       f"distances use an older price.")
-    if signal_source == "frozen" and act_mode in ("signal", "orderplan"):
-        _lines.append("✓ <b>Signal not affected:</b> the rebalance signal is frozen from complete "
-                      f"{next_signal.date()} data, so these gaps cannot change it.")
-    elif stale_signal or stale_actions:
-        _lines.append(f"⚠ <b>Signal affected:</b> {', '.join(sorted(set(stale_signal) | set(stale_actions)))} "
+    if stale_signal or stale_actions:
+        _lines.append(f"⚠ <b>Ranking affected:</b> {', '.join(sorted(set(stale_signal) | set(stale_actions)))} "
                       f"— ranking and actions may change once the missing prices arrive.")
-    if signal_source == "frozen" and act_mode in ("signal", "orderplan"):
-        pass
-    elif signal_status == "READY" and (stale_signal or stale_actions or market_delayed):
-        _lines.append("<b>Do not act on this signal yet.</b> Rerun later with <code>--force</code> "
-                      "once all prices are available.")
-    else:
-        _lines.append("Rerun later with <code>--force</code> to refresh once Yahoo has the missing prices.")
+    _lines.append("Rerun later with <code>--force</code> to refresh once Yahoo has the missing prices.")
     data_html = ("<div class='datawarn'><div class='dw-title'>⚠ DATA DELAYED</div>"
                  + "".join(f"<p>{l}</p>" if not l.startswith("<ul>") else l for l in _lines) + "</div>")
 if near_miss:
     data_html += ("<p class='muted'>Excluded for short Yahoo history, only a few rows below the "
                   f"{MIN_HISTORY}-row minimum (a delayed day can cause this): "
                   + ", ".join(f"{s} ({n}/{MIN_HISTORY})" for s, n in near_miss.items()) + "</p>")
-act_data_warn = ("" if not (stale_actions or stale_signal or market_delayed)
-                 or (signal_source == "frozen" and act_mode in ("signal", "orderplan")) else
+act_data_warn = ("" if not (stale_actions or stale_signal or market_delayed) else
                  "<div class='datawarn slim'>⚠ Some prices behind these actions are delayed — "
                  "see the data warning at the top. Actions may change after the data catches up.</div>")
 
@@ -1504,43 +1432,40 @@ market_html = ("" if not MARKET_HOURS else
                f"<div class='marketopen'>🕒 <b>Market open</b> — today's ({TODAY.date()}) prices are live quotes, "
                f"not closing prices, so they are not used in the portfolio history. Values below are as of the "
                f"{AS_OF.date()} close" + (" (the order plan uses live prices)." if order_plan else ".") + "</div>")
-_src_txt =(f" Signal frozen from complete {next_signal.date()} data "
-            f"({(frozen_next or {}).get('signal_frozen', {}).get('at_ist', '')} IST)." if signal_source == "frozen" else "")
 if act_mode == "orderplan":
-    act_banner = (f"🛒 ORDER PLAN — execute TODAY ({TODAY.date()}) before the close · "
-                  f"live prices at {live_quote_time} IST · NOT executed yet")
-    act_caption = (f"Final signal from the {next_signal.date()} close.{_src_txt} Quantities = target ÷ the live "
-                   f"price at {live_quote_time} IST (Yahoo may lag — check your broker's price; quantity = target ÷ "
-                   f"price, whole units). The strategy record is made from today's close after 16:00 IST."
+    act_banner = (f"🛒 ORDER PLAN — entry day {TODAY.date()} · signal and quantities from live prices at "
+                  f"{live_quote_time} IST · NOT recorded yet")
+    act_caption = (f"Today is the entry day: momentum, 200-DMA, ranking and stops use today's live Yahoo price "
+                   f"at {live_quote_time} IST as today's price. Quantities = target ÷ live price, whole units "
+                   f"(Yahoo may lag — check your broker's price). This run's choice is saved; the trade is recorded "
+                   f"at today's close by the next run after 16:00 IST (the 20:15 evening run)."
                    + (f" No live quote for: {', '.join(order_plan_missing_quotes)} — last close used."
                       if order_plan_missing_quotes else ""))
     act_prefix = "ORDER"
 elif act_mode == "incomplete":
-    act_banner = "⛔ SIGNAL DATA INCOMPLETE — do not trade on this signal"
-    act_caption = (f"{len(signal_missing)} ETFs have no {AS_OF.date()} price on Yahoo "
-                   f"({', '.join(signal_missing)}), so the ranking below uses older prices for them and may be "
-                   f"wrong. Wait for the data to complete and re-run (tonight's 20:15 IST run re-checks).")
+    act_banner = "⛔ DATA INCOMPLETE — do not trade on this order plan"
+    act_caption = (f"{len(signal_missing)} ETFs have no live price on Yahoo ({', '.join(signal_missing)}), so the "
+                   f"ranking below uses yesterday's close for them and may be wrong. Re-run the workflow in a few "
+                   f"minutes.")
     act_prefix = "UNRELIABLE"
 elif act_mode == "executed":
-    act_banner = f"EXECUTED — {AS_OF:%B} rebalance executed on {AS_OF.date()}"
-    act_caption = (f"Signal from the {cur_signal.date()} close; orders filled at the {AS_OF.date()} "
-                   f"execution-day price shown.")
+    act_banner = f"EXECUTED — {AS_OF:%B} entry-day rebalance recorded at the {AS_OF.date()} close"
+    act_caption = (f"Entry day {AS_OF.date()}: signal and fills at that day's close. "
+                   f"Decision: {signal_source}.")
     act_prefix = "EXECUTED"
-elif act_mode == "signal":
-    act_banner = (f"SIGNAL FINAL — generated from the {AS_OF.date()} close · execution scheduled for "
-                  f"{next_rebal.date()}{_exp(next_confirmed)}")
-    act_caption = ("Planned orders. Not executed yet: quantities and values use the signal-day close as an "
-                   "estimate; actual fills use the execution-day price." + _src_txt)
-    act_prefix = "SIGNAL"
 else:
-    act_banner = "PREVIEW — signal may change before signal date"
-    act_caption = (f"Uses the latest close ({AS_OF.date()}), which is not the final signal. Final signal: "
-                   f"{next_signal.date()}{_exp(next_signal_known)} close · execution: "
-                   f"{next_rebal.date()}{_exp(next_confirmed)}. Prices are estimates.")
+    act_banner = (f"PREVIEW — from the latest close ({AS_OF.date()}); final decision on the entry day "
+                  f"{next_rebal.date()}{_exp(next_confirmed)}")
+    act_caption = (f"Uses the latest close ({AS_OF.date()}), which is not the final decision. On the entry day "
+                   f"{next_rebal.date()}{_exp(next_confirmed)} run the workflow during market hours (~14:00 IST) "
+                   f"for the order plan from live prices. Prices are estimates.")
+    if signal_status == "ENTRY DAY":
+        act_caption = (f"Today ({TODAY.date()}) is the entry day, but the market is closed and today's close is "
+                       f"not in the data yet. Run the workflow during market hours for the order plan, or after "
+                       f"Yahoo publishes today's close to record it.")
     act_prefix = "PREVIEW"
     if not live_started:
-        act_caption = (f"Initialisation preview for a fresh {inr(INITIAL_CAPITAL)} using the latest close "
-                       f"({AS_OF.date()}). " + act_caption.split(". ", 1)[1])
+        act_caption = f"Initialisation preview for a fresh {inr(INITIAL_CAPITAL)}. " + act_caption
 
 actions_html = f"""
 <div class='banner {act_mode}'>{act_banner}</div>
@@ -1624,8 +1549,7 @@ signals_html = table(
 
 trade_cols = [
     ("trade_id", "Trade #", str), ("symbol", "Symbol", None), ("category", "Category", None),
-    ("entry_signal_date", "Entry Signal Date", None), ("entry_date", "Entry Date (exec)", None),
-    ("exit_signal_date", "Exit Signal Date", None), ("exit_date", "Exit Date (exec)", None),
+    ("entry_date", "Entry Date", None), ("exit_date", "Exit Date", None),
     ("entry_price", "Entry Price", num), ("exit_price", "Exit Price", num), ("qty", "Qty", str),
     ("cost", "Cost ₹", inr), ("proceeds", "Proceeds ₹", inr), ("pnl_inr", "P&L ₹", inr),
     ("pnl_pct", "P&L %", pct), ("hold_days", "Hold Days", str), ("peak_price", "Peak Price", num),
@@ -1657,7 +1581,7 @@ if live_started:
                                entries=m["entries"] or "—", exits=m["exits"] or "—",
                                skipped=m["skipped"] or "—", holdings=m["holdings"] or "—"))
 rebal_cols = [
-    ("sdate", "Signal Date", None), ("date", "Execution Date", None),
+    ("date", "Entry Day", None),
     ("value", "Portfolio Value", inr), ("invested", "Invested", inr),
     ("cash", "Cash", inr), ("n_held", "Positions", str), ("ret", "Return since prev. rebalance", pct),
     ("entries", "Bought", None), ("exits", "Sold", None), ("skipped", "Skipped (below DMA)", None),
@@ -1731,23 +1655,21 @@ if not charts_html.replace("<div class='grid2'></div>", ""):
 
 # ── Next rebalance / rules ───────────────────────────────────────────────────
 _status_txt = {
-    "EXECUTED": f"{AS_OF:%B} rebalance executed on {AS_OF.date()} (signal {cur_signal.date() if cur_signal is not None else '—'}).",
-    "READY": f"Signal finalized using {next_signal.date()} close · execution scheduled for {next_rebal.date()}{_exp(next_confirmed)}.",
-    "PENDING": f"Signal date not reached — latest data is {AS_OF.date()}. Current signals are a PREVIEW only.",
-    "INCOMPLETE": f"Signal-day prices missing for {len(signal_missing)} ETFs — signal not reliable yet.",
+    "EXECUTED": f"{AS_OF:%B} entry-day rebalance recorded at the {AS_OF.date()} close.",
+    "ORDER PLAN": f"Entry day — ORDER PLAN from live prices at {live_quote_time} IST.",
+    "ENTRY DAY": "Today is the entry day — run the workflow during market hours for the order plan.",
+    "PENDING": f"Entry day not reached — latest data is {AS_OF.date()}. Current actions are a PREVIEW only.",
+    "INCOMPLETE": f"Live prices missing for {len(signal_missing)} ETFs — order plan not reliable yet.",
 }[signal_status]
-if order_plan:
-    _status_txt += f" Execution day — ORDER PLAN uses live prices at {live_quote_time} IST."
 next_html = f"""<div class='kpis'>
 {kpi("Latest Market Data", str(AS_OF.date()))}
-{kpi("Last Rebalance", (f"{cur_signal.date()} → {cur_rebal.date()}" if cur_rebal is not None else "Not started"))}
-{kpi("Next Signal Date" + _exp(next_signal_known), next_signal.strftime("%a %d %b %Y"))}
-{kpi("Next Execution Date" + _exp(next_confirmed), next_rebal.strftime("%a %d %b %Y"))}
-{kpi("Signal Status", signal_status, {"EXECUTED": "g", "READY": "amber", "PENDING": "", "INCOMPLETE": "r"}[signal_status])}
-{kpi("Days to Execution", str(max(days_to_next, 0)))}
+{kpi("Last Entry Day", str(cur_rebal.date()) if cur_rebal is not None else "Not started")}
+{kpi("Next Entry Day" + _exp(next_confirmed), next_rebal.strftime("%a %d %b %Y"))}
+{kpi("Status", signal_status, {"EXECUTED": "g", "ORDER PLAN": "amber", "ENTRY DAY": "amber", "PENDING": "", "INCOMPLETE": "r"}[signal_status])}
+{kpi("Days to Entry Day", str(max(days_to_next, 0)))}
 </div>
-<p class='muted'>{_status_txt} Signal = previous trading day's close; execution = first trading day of the
-month. {"" if next_confirmed and next_signal_known else
+<p class='muted'>{_status_txt} The entry day (first trading day of the month) is both the signal day and the
+execution day. {"" if next_confirmed else
  "Future sessions are not in the price data yet, so expected dates skip weekends only; an NSE holiday "
  "moves them to the adjacent trading session."}</p>"""
 
@@ -1760,8 +1682,9 @@ rules = [
     ("Hard SL", f"{SL_PCT * 100:.0f}% below entry"),
     ("Trailing SL", f"{TRAIL_PCT * 100:.0f}% below peak (peak ratchets on rebalance dates)"),
     ("Idle Cash Rate", f"{LIQUID_RATE * 100:.0f}% p.a."),
-    ("Rebalance timing", "Signal (momentum, 200-DMA, ranking, stops) on the previous trading day's close; "
-                         "execution on the first trading day of the month at that day's close"),
+    ("Rebalance timing", "Entry day = first trading day of the month: signal (momentum, 200-DMA, ranking, "
+                         "stops) and execution both at that day's close. Live: the order plan uses the entry "
+                         "day's live price; the chosen ETFs are recorded at the close"),
     ("Position sizing", "New entries = total value at execution / N_HOLD, whole units; no resizing"),
     ("Universe", f"C54 — {len(SYMBOLS)} with enough history"
                  + (f"; dropped: {', '.join(dropped)}" if dropped else "")),
@@ -1885,8 +1808,7 @@ document.addEventListener('toggle', resizeCharts, true);
  <span>Strategy: <b>ETF Momentum Rotation</b></span>
  <span>Universe: <b>C54</b></span>
  <span>Latest Market Data: <b>{AS_OF.date()}</b></span>
- <span>Next Signal Date: <b>{next_signal.date()}{_exp(next_signal_known)}</b></span>
- <span>Next Execution Date: <b>{next_rebal.date()}{_exp(next_confirmed)}</b></span>
+ <span>Next Entry Day: <b>{next_rebal.date()}{_exp(next_confirmed)}</b></span>
  <span>Status: <b>{signal_status}</b></span>
  <span>Data: <b class="{'g' if data_ok else 'amber'}">{'✓ Current' if data_ok else '⚠ Delayed'}</b></span>
  <span>Generated: <b>{now_ist():%Y-%m-%d %H:%M} IST</b></span>
@@ -1978,15 +1900,15 @@ summary = {
     "invested": invested, "cash": live_cash,
     "n_positions": len(pos_rows), "n_hold": N_HOLD,
     "max_dd_pct": live_max_dd, "closed_trades": n_lt,
-    "signal_status": signal_status,               # PENDING / READY / INCOMPLETE / EXECUTED
-    "act_mode": act_mode,                         # preview / signal / orderplan / incomplete / executed
+    "signal_status": signal_status,               # PENDING / ENTRY DAY / ORDER PLAN / INCOMPLETE / EXECUTED
+    "act_mode": act_mode,                         # preview / orderplan / incomplete / executed
     "market_hours": MARKET_HOURS,
     "live_quote_time": live_quote_time,
     "order_plan_missing_quotes": order_plan_missing_quotes,
-    "signal_source": signal_source,               # frozen / computed
-    "signal_missing": signal_missing,
-    "frozen_months": sorted(FROZEN),
-    "freeze_notes": freeze_notes,
+    "signal_source": signal_source,               # live / decision source of a recorded entry / latest close
+    "signal_missing": signal_missing,             # ETFs without a live price (order plan)
+    "saved_entries": sorted(_entries_new),
+    "entry_notes": entry_notes,
     "last_signal_date": cur_signal.date() if cur_signal is not None else None,
     "last_exec_date": cur_rebal.date() if cur_rebal is not None else None,
     "next_signal_date": next_signal.date(), "next_signal_known": next_signal_known,

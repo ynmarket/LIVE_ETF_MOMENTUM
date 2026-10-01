@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
-      contents: write          # to commit live_state/rebalances.json (frozen live rebalances)
+      contents: write          # to commit live_state/entry_decisions.json (entry-day decisions)
     outputs:
       problem: ${{ steps.diagnose.outputs.problem }}
 
@@ -79,21 +79,21 @@ jobs:
           python -c "import json; json.load(open('reports/summary.json'))" || { echo "::error title=Summary file problem::reports/summary.json missing or invalid"; exit 1; }
           ls -l reports/
 
-      # Signals / fills computed from COMPLETE data are frozen by the script; commit them so every
-      # later run replays them instead of recomputing from Yahoo (which can withdraw past prices).
-      - name: Save frozen rebalances
+      # The ETFs chosen on the entry day (live_state/entry_decisions.json) are saved by the script;
+      # commit them so the evening run (and every later run) records exactly that choice.
+      - name: Save entry-day decision
         id: freeze
         run: |
           if [ -n "$(git status --porcelain -- live_state)" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add live_state/rebalances.json
-            git commit -m "Freeze live rebalance data ($(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M') IST)"
+            git add -A live_state
+            git commit -m "Save entry-day decision ($(TZ=Asia/Kolkata date '+%Y-%m-%d %H:%M') IST)"
             git pull --rebase origin main
             git push origin HEAD:main
-            echo "Frozen rebalances committed."
+            echo "Entry-day decision committed."
           else
-            echo "No new frozen rebalance."
+            echo "No new entry-day decision."
           fi
 
       # The summary currently on GitHub Pages = the last successful run. Used only so the
@@ -132,7 +132,7 @@ jobs:
               *) p="Strategy script error (exit code ${{ steps.run.outputs.code }})" ;;
             esac
           elif [ "${{ steps.verify.outcome }}" = "failure" ]; then p="Report check failed (file/HTML/Excel problem)"
-          elif [ "${{ steps.freeze.outcome }}" = "failure" ]; then p="Could not save frozen rebalance data (git push)"
+          elif [ "${{ steps.freeze.outcome }}" = "failure" ]; then p="Could not save the entry-day decision (git push)"
           else p="Workflow setup problem"
           fi
           echo "problem=$p" >> "$GITHUB_OUTPUT"
