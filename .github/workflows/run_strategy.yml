@@ -8,13 +8,9 @@ on:
         description: "Send Telegram messages for this run"
         type: boolean
         default: true
-  # Automatic (GitHub cron is UTC; time below is IST). Off the hour to avoid peak delays.
-  # Evening only: a morning run was removed because Yahoo withdraws the previous day's prices
-  # overnight for many ETFs, which produced misleading signals.
-  schedule:
-    - cron: "45 14 * * 1-5"   # 20:15 IST Mon–Fri — evening run after NSE close
+  # Manual runs only — there is no automatic schedule.
 
-# One run at a time: a scheduled and a manual run never overlap (the second one waits)
+# One run at a time: if the workflow is started twice, the second run waits
 concurrency:
   group: run-etf-strategy
   cancel-in-progress: false
@@ -96,15 +92,6 @@ jobs:
             echo "No new frozen rebalance."
           fi
 
-      # The summary currently on GitHub Pages = the last successful run. Used only so the
-      # Telegram step does not repeat alerts that were already sent.
-      - name: Fetch previously published summary
-        run: |
-          owner="${GITHUB_REPOSITORY_OWNER,,}"; repo="${GITHUB_REPOSITORY#*/}"
-          curl -fsSL --max-time 20 "https://${owner}.github.io/${repo}/summary.json?run=${GITHUB_RUN_ID}" \
-               -o reports/previous_summary.json \
-            || { echo "No previous summary published yet (first run?)"; rm -f reports/previous_summary.json; }
-
       - name: Upload report artifact
         if: always()   # keep whatever was generated, even when a step failed
         uses: actions/upload-artifact@v7
@@ -114,7 +101,6 @@ jobs:
             reports/ETF_Momentum_Test_1_Report.html
             reports/ETF_Momentum_Test_1_Report.xlsx
             reports/summary.json
-            reports/previous_summary.json
           if-no-files-found: warn
           retention-days: 30
 
@@ -176,8 +162,8 @@ jobs:
   notify:
     name: Telegram alerts
     needs: [run-strategy, deploy-pages]
-    # Scheduled runs always notify; manual runs only when the "telegram" box is ticked
-    if: always() && (github.event_name == 'schedule' || inputs.telegram)
+    # Runs only when the "Send Telegram messages" box is ticked
+    if: always() && inputs.telegram
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
@@ -199,33 +185,12 @@ jobs:
           RUN_RESULT: ${{ needs.run-strategy.result }}
           DEPLOY_RESULT: ${{ needs.deploy-pages.result }}
           PROBLEM: ${{ needs.run-strategy.outputs.problem }}
-          SCHEDULE: ${{ github.event.schedule }}
         run: |
           if [ "$RUN_RESULT" != "success" ]; then
             python3 notify_telegram.py --failure "${PROBLEM:-Workflow problem ($RUN_RESULT)}"
           elif [ "$DEPLOY_RESULT" != "success" ]; then
             python3 notify_telegram.py --failure "GitHub Pages deployment problem (the report was generated but not published)"
           else
-            case "$SCHEDULE" in
-              "45 14 * * 1-5") mode=evening ;;
-              *)               mode=manual ;;
-            esac
-            prev=""; [ -f reports/previous_summary.json ] && prev="--previous reports/previous_summary.json"
-            python3 notify_telegram.py --summary reports/summary.json $prev --mode "$mode"
+            python3 notify_telegram.py --summary reports/summary.json
           fi
 
-  # GitHub disables scheduled workflows after 60 days without repository activity.
-  # Re-enabling the workflow through the API on each scheduled run keeps it active
-  # without making any commits.
-  keepalive:
-    name: Keep schedule active
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      actions: write
-    steps:
-      - name: Re-enable this workflow
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/run_strategy.yml/enable"

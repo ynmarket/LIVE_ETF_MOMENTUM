@@ -1511,7 +1511,8 @@ if act_mode == "orderplan":
                   f"live prices at {live_quote_time} IST · NOT executed yet")
     act_caption = (f"Final signal from the {next_signal.date()} close.{_src_txt} Quantities = target ÷ the live "
                    f"price at {live_quote_time} IST (Yahoo may lag — check your broker's price; quantity = target ÷ "
-                   f"price, whole units). The strategy record is made from today's close after 16:00 IST."
+                   f"price, whole units). The strategy records the trade at today's close the next time "
+                   f"the workflow is run after 16:00 IST."
                    + (f" No live quote for: {', '.join(order_plan_missing_quotes)} — last close used."
                       if order_plan_missing_quotes else ""))
     act_prefix = "ORDER"
@@ -1519,7 +1520,7 @@ elif act_mode == "incomplete":
     act_banner = "⛔ SIGNAL DATA INCOMPLETE — do not trade on this signal"
     act_caption = (f"{len(signal_missing)} ETFs have no {AS_OF.date()} price on Yahoo "
                    f"({', '.join(signal_missing)}), so the ranking below uses older prices for them and may be "
-                   f"wrong. Wait for the data to complete and re-run (tonight's 20:15 IST run re-checks).")
+                   f"wrong. Wait for Yahoo to complete the data and re-run the workflow.")
     act_prefix = "UNRELIABLE"
 elif act_mode == "executed":
     act_banner = f"EXECUTED — {AS_OF:%B} rebalance executed on {AS_OF.date()}"
@@ -1527,7 +1528,7 @@ elif act_mode == "executed":
                    f"execution-day price shown.")
     act_prefix = "EXECUTED"
 elif act_mode == "signal":
-    act_banner = (f"SIGNAL FINAL — generated from the {AS_OF.date()} close · execution scheduled for "
+    act_banner = (f"SIGNAL FINAL — generated from the {AS_OF.date()} close · execute on "
                   f"{next_rebal.date()}{_exp(next_confirmed)}")
     act_caption = ("Planned orders. Not executed yet: quantities and values use the signal-day close as an "
                    "estimate; actual fills use the execution-day price." + _src_txt)
@@ -1732,7 +1733,7 @@ if not charts_html.replace("<div class='grid2'></div>", ""):
 # ── Next rebalance / rules ───────────────────────────────────────────────────
 _status_txt = {
     "EXECUTED": f"{AS_OF:%B} rebalance executed on {AS_OF.date()} (signal {cur_signal.date() if cur_signal is not None else '—'}).",
-    "READY": f"Signal finalized using {next_signal.date()} close · execution scheduled for {next_rebal.date()}{_exp(next_confirmed)}.",
+    "READY": f"Signal finalized using {next_signal.date()} close · execute on {next_rebal.date()}{_exp(next_confirmed)}.",
     "PENDING": f"Signal date not reached — latest data is {AS_OF.date()}. Current signals are a PREVIEW only.",
     "INCOMPLETE": f"Signal-day prices missing for {len(signal_missing)} ETFs — signal not reliable yet.",
 }[signal_status]

@@ -8,18 +8,16 @@ Reads reports/summary.json (written by ETF_Momentum_Test_1.py) and sends:
   ✅ rebalance executed                      (execution day, status EXECUTED)
   ⚠️ exit risk                               (stop hit, near a stop, or outside the top 6)
   ⚠️ data delayed                            (held / top-6 / action ETFs without the latest price)
-  📊 daily summary                           (evening and manual runs)
+  📊 daily summary                           (every run)
   ❌ run failed                              (--failure)
 
-Alert messages are de-duplicated against the previously published summary, so the
-same alert is not repeated on every run (manual runs always send everything).
-Standard library only. Never prints the bot token.
+The workflow runs manually only, so every run sends the messages that apply to the
+current state. Standard library only. Never prints the bot token.
 
 Usage:
-  python notify_telegram.py --summary reports/summary.json --previous reports/previous_summary.json --mode evening
-  (--mode morning is kept for compatibility; no morning schedule is used any more)
+  python notify_telegram.py --summary reports/summary.json
   python notify_telegram.py --failure "Data download problem"
-  python notify_telegram.py --summary reports/summary.json --mode manual --dry-run
+  python notify_telegram.py --summary reports/summary.json --dry-run
 Env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID (GitHub secrets); GITHUB_* set by Actions.
 """
 import argparse
@@ -96,7 +94,7 @@ def footer():
 
 
 # ── message builders ─────────────────────────────────────────────────────────
-def msg_summary(s, prev):
+def msg_summary(s):
     lines = [f"📊 <b>ETF Momentum — Daily Summary</b>",
              f"Data as of {d(s['as_of'])} · generated {esc(s['generated_ist'])} IST", ""]
     if s["live_started"]:
@@ -123,8 +121,6 @@ def msg_summary(s, prev):
     else:
         n = sum(len(v) for v in data["stale"].values())
         lines.append(f"📡 Data: ⚠️ delayed ({n} ETFs without a {s['as_of']} price)")
-    if prev and prev.get("as_of") == s["as_of"] and prev.get("generated_ist", "")[:10] != s["generated_ist"][:10]:
-        lines.append("ℹ️ No new market data since the last run (holiday, or Yahoo not updated yet).")
     return "\n".join(lines) + footer()
 
 
@@ -191,7 +187,8 @@ def msg_order_plan(s):
         lines.append("⚠️ No live quote for " + ", ".join(esc(x) for x in s["order_plan_missing_quotes"])
                      + " — last close used.")
     lines += ["", "Yahoo prices can lag — use your broker's live price: quantity = target ÷ price, rounded "
-                  "down. The strategy records the trade at today's close after 16:00 IST."]
+                  "down. The strategy records the trade at today's close the next time you run the workflow "
+                  "after 16:00 IST."]
     return "\n".join(lines) + footer()
 
 
@@ -200,12 +197,8 @@ def msg_incomplete(s):
     lines = ["⛔ <b>SIGNAL DATA INCOMPLETE — do not trade on it</b>",
              f"{len(miss)} ETFs have no {d(s['as_of'])} price on Yahoo: " + ", ".join(esc(x) for x in miss),
              "The ranking would use older prices for them and may be wrong.",
-             "Re-run the workflow later; the scheduled 20:15 IST run re-checks automatically."]
+             "Re-run the workflow later, once Yahoo has the missing prices."]
     return "\n".join(lines) + footer()
-
-
-def key_incomplete(s):
-    return (s["as_of"], s["signal_status"], sorted(s.get("signal_missing", [])))
 
 
 def msg_executed(s):
@@ -280,56 +273,22 @@ def msg_failure(problem):
     return "\n".join(lines)
 
 
-# ── de-duplication keys (what makes an alert "new") ──────────────────────────
-def key_signal(s):
-    a = s["actions"]
-    return (s["signal_status"], s["next_exec_date"], _signal_provisional(s),
-            sorted((x["symbol"], x["qty"]) for x in a["BUY"]),
-            sorted((x["symbol"], x["reason"]) for x in a["SELL"]),
-            sorted(x["symbol"] for x in a["SKIP"]))
-
-
-def key_executed(s):
-    return (s["signal_status"], s["last_exec_date"])
-
-
-def key_risk(s):
-    return sorted((p["symbol"], p["status"]) for p in risky_positions(s))
-
-
-def key_data(s):
-    data = s["data"]
-    return (s["as_of"], data_affected(s), sorted(data["stale_held"]), sorted(data["stale_signal"]),
-            sorted(data["stale_actions"]), data["market_delayed"])
-
-
-def build_messages(s, prev, mode):
-    dedupe = mode != "manual" and prev is not None
-
-    def new(keyfn):
-        if not dedupe:
-            return True
-        try:
-            return keyfn(s) != keyfn(prev)
-        except (KeyError, TypeError):   # previous summary from an older format
-            return True
-
+def build_messages(s):
     msgs = []
     act_mode = s.get("act_mode")
     if act_mode == "orderplan":
-        msgs.append(msg_order_plan(s))              # manual pre-close run: always send
-    elif act_mode == "incomplete" and new(key_incomplete):
+        msgs.append(msg_order_plan(s))
+    elif act_mode == "incomplete":
         msgs.append(msg_incomplete(s))
-    elif s["signal_status"] == "READY" and new(key_signal):
+    elif s["signal_status"] == "READY":
         msgs.append(msg_signal(s))
-    if s["signal_status"] == "EXECUTED" and new(key_executed):
+    if s["signal_status"] == "EXECUTED":
         msgs.append(msg_executed(s))
-    if risky_positions(s) and new(key_risk):
+    if risky_positions(s):
         msgs.append(msg_exit_risk(s))
-    if data_affected(s) and new(key_data):
+    if data_affected(s):
         msgs.append(msg_data(s))
-    if mode in ("evening", "manual"):
-        msgs.append(msg_summary(s, prev))
+    msgs.append(msg_summary(s))
     return msgs
 
 
@@ -367,8 +326,6 @@ def load_json(path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--summary", default="reports/summary.json")
-    ap.add_argument("--previous", default=None, help="previous published summary.json (for de-duplication)")
-    ap.add_argument("--mode", choices=["evening", "morning", "manual"], default="manual")
     ap.add_argument("--failure", metavar="PROBLEM", help="send a failure alert instead of the report messages")
     ap.add_argument("--dry-run", action="store_true", help="print messages instead of sending them")
     args = ap.parse_args()
@@ -380,10 +337,8 @@ def main():
         if s is None:
             print(f"::error::Summary file not found or invalid: {args.summary}")
             return 1
-        prev = load_json(args.previous) if args.previous else None
-        print(f"Mode: {args.mode} | previous summary: {'found' if prev else 'none'} | "
-              f"status {s['signal_status']} | data {s['data']['status']}")
-        msgs = build_messages(s, prev, args.mode)
+        print(f"Status {s['signal_status']} | mode {s.get('act_mode')} | data {s['data']['status']}")
+        msgs = build_messages(s)
 
     if not msgs:
         print("Nothing new to report — no Telegram message sent.")
