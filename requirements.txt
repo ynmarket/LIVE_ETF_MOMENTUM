@@ -5,3 +5,6 @@ pandas==3.0.6
 numpy==2.5.3
 openpyxl==3.1.5
 plotly==7.1.0
+# Google Sheet "My Trades" (read-only, service account)
+google-auth==2.59.1
+requests==2.34.2

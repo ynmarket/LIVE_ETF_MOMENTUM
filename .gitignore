@@ -3,6 +3,10 @@ reports/
 public/
 ETF_Momentum_Output/
 
+# Local secrets / settings (Google Sheet ID + service-account key path) — never committed
+local_config.json
+*service_account*.json
+
 # Python
 __pycache__/
 *.pyc

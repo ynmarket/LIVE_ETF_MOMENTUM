@@ -126,7 +126,29 @@ def msg_summary(s, prev):
         lines.append(f"📡 Data: ⚠️ delayed ({n} ETFs without a {s['as_of']} price)")
     if prev and prev.get("as_of") == s["as_of"] and prev.get("generated_ist", "")[:10] != s["generated_ist"][:10]:
         lines.append("ℹ️ No new market data since the last run (holiday, or Yahoo not updated yet).")
+    lines += account_lines(s)
     return "\n".join(lines) + footer()
+
+
+def account_lines(s):
+    """'My account' block from the Google Sheet (real trades)."""
+    a, err = s.get("account"), s.get("account_error")
+    if a is None:
+        return [] if err in (None, "not configured") else ["", f"👤 My account: ⚠️ could not read the Google Sheet ({esc(err)[:120]})"]
+    out = ["", "👤 <b>My account</b> (Google Sheet)",
+           f"Value <b>{inr(a['value'])}</b> ({pct(a['ret_pct'])}) · P&amp;L {inr(a['pnl'])}",
+           f"Unrealised {inr(a['upnl'])} · Realised {inr(a['realised'])} · Charges {inr(a['charges'])} · "
+           f"Cash {inr(a['cash'])}"]
+    if a.get("latest_month"):
+        if not a.get("latest_entered"):
+            out.append(f"📝 No trades entered for {a['latest_month']} yet")
+        elif a["latest_mismatches"] == 0:
+            out.append(f"✓ {a['latest_month']} trades match the strategy plan")
+        else:
+            out.append(f"⚠️ {a['latest_mismatches']} difference(s) from the {a['latest_month']} strategy plan")
+    if a.get("issues"):
+        out.append(f"⚠️ {len(a['issues'])} sheet row(s) have problems — see the report")
+    return out
 
 
 def msg_order_plan(s):

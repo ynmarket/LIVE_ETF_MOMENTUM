@@ -22,7 +22,8 @@ def _ensure(pkg, import_as=None):
 
 
 for _p, _i in [("yfinance", "yfinance"), ("pandas", "pandas"), ("numpy", "numpy"),
-               ("openpyxl", "openpyxl"), ("plotly", "plotly")]:
+               ("openpyxl", "openpyxl"), ("plotly", "plotly"), ("google-auth", "google.auth"),
+               ("requests", "requests")]:
     _ensure(_p, _i)
 
 import copy
@@ -1052,6 +1053,268 @@ print(f"  [Historical reference {first_d.date()}→{LAST_DATE.date()}: CAGR {cag
 print("═" * 60)
 
 # ═════════════════════════════════════════════════════════════════════════════
+# MY ACCOUNT — real trades from the Google Sheet (read-only; never changes the strategy)
+# ═════════════════════════════════════════════════════════════════════════════
+# The user records every real fill in the Google Sheet "Trades" tab (and optionally deposits etc. in
+# "Cash"). A Google service account with VIEWER access reads it. Credentials:
+#   GitHub Actions: secrets GSHEET_ID + GOOGLE_SERVICE_ACCOUNT_JSON (passed as environment variables)
+#   Local runs:     local_config.json (git-ignored) {"gsheet_id": ..., "service_account_file": ...}
+LOCAL_CONFIG_PATH = BASE_DIR / "local_config.json"
+SHEET_EPOCH = datetime(1899, 12, 30)              # Google Sheets serial-date day 0
+TRADE_COLS = {"date": "Trade Date", "symbol": "Symbol", "side": "Side", "qty": "Quantity",
+              "price": "Price", "charges": "Charges ₹", "month": "Entry Month", "order_id": "Order ID",
+              "notes": "Notes"}
+CASH_COLS = {"date": "Date", "type": "Type", "amount": "Amount ₹", "notes": "Notes"}
+UNIVERSE_SYMBOLS = {s for s, _ in UNIVERSE}
+
+
+def _account_credentials():
+    """(sheet_id, service-account info dict) or (None, None) when not configured."""
+    cfg = {}
+    try:
+        cfg = json.loads(LOCAL_CONFIG_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        pass
+    except ValueError as e:
+        print(f"  [warn] {LOCAL_CONFIG_PATH.name} is not valid JSON ({e})")
+    sheet_id = (os.environ.get("GSHEET_ID") or cfg.get("gsheet_id") or "").strip() or None
+    info = None
+    if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+    elif cfg.get("service_account_file"):
+        info = json.loads(Path(cfg["service_account_file"]).read_text(encoding="utf-8"))
+    return sheet_id, info
+
+
+def read_trade_sheet():
+    """Read the Trades and Cash tabs. Returns (trade_rows, cash_rows, error) — rows are lists of dicts
+    keyed by column header; error is None on success, a message otherwise. Never raises."""
+    try:
+        sheet_id, info = _account_credentials()
+        if not sheet_id or not info:
+            return None, None, "not configured"
+        import requests
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
+        creds.refresh(Request())
+        r = requests.get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values:batchGet",
+            params=[("ranges", "Trades!A1:I"), ("ranges", "Cash!A1:D"),
+                    ("valueRenderOption", "UNFORMATTED_VALUE"), ("dateTimeRenderOption", "SERIAL_NUMBER")],
+            headers={"Authorization": f"Bearer {creds.token}"}, timeout=30)
+        if r.status_code != 200:
+            return None, None, f"Google Sheets API HTTP {r.status_code}: {r.text[:200]}"
+        tabs = []
+        for vr in r.json().get("valueRanges", []):
+            vals = vr.get("values", [])
+            header = [str(h).strip() for h in vals[0]] if vals else []
+            rows = []
+            for n, row in enumerate(vals[1:], start=2):              # n = sheet row number
+                if not any(str(c).strip() for c in row):
+                    continue
+                d = {h: (row[i] if i < len(row) else "") for i, h in enumerate(header)}
+                d["_row"] = n
+                rows.append(d)
+            tabs.append((header, rows))
+        (t_head, t_rows), (c_head, c_rows) = tabs
+        missing = [h for h in ("Trade Date", "Symbol", "Side", "Quantity", "Price") if h not in t_head]
+        if missing:
+            return None, None, f"Trades tab is missing header(s): {', '.join(missing)}"
+        return t_rows, c_rows, None
+    except Exception as e:                                           # network, key, permission …
+        return None, None, f"{type(e).__name__}: {e}"
+
+
+def _sheet_date(v):
+    """Sheets serial number or text → Timestamp (None if empty/invalid)."""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return pd.Timestamp(SHEET_EPOCH + timedelta(days=float(v))).normalize()
+    t = str(v).strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y", "%d %b %Y", "%d-%b-%Y"):
+        try:
+            return pd.Timestamp(datetime.strptime(t, fmt))
+        except ValueError:
+            pass
+    return None
+
+
+def _num(v):
+    if v in ("", None):
+        return None
+    try:
+        return float(str(v).replace(",", "").replace("₹", "").strip())
+    except ValueError:
+        return None
+
+
+def parse_trades(t_rows):
+    """Validate sheet rows → (good trades, issues). Bad rows are listed, never silently used."""
+    good, issues = [], []
+    for row in t_rows:
+        n, errs = row["_row"], []
+        d = _sheet_date(row.get(TRADE_COLS["date"], ""))
+        sym = str(row.get(TRADE_COLS["symbol"], "")).strip().upper()
+        side = str(row.get(TRADE_COLS["side"], "")).strip().upper()
+        qty, price = _num(row.get(TRADE_COLS["qty"])), _num(row.get(TRADE_COLS["price"]))
+        ch = _num(row.get(TRADE_COLS["charges"]))
+        if d is None:
+            errs.append("Trade Date missing or not a date")
+        if sym not in UNIVERSE_SYMBOLS:
+            errs.append(f"unknown Symbol '{sym}'")
+        if side not in ("BUY", "SELL"):
+            errs.append(f"Side must be BUY or SELL (got '{side}')")
+        if qty is None or qty <= 0 or qty != int(qty):
+            errs.append("Quantity must be a positive whole number")
+        if price is None or price <= 0:
+            errs.append("Price must be a positive number")
+        if row.get(TRADE_COLS["charges"], "") not in ("", None) and (ch is None or ch < 0):
+            errs.append("Charges must be a number ≥ 0")
+        m_raw = row.get(TRADE_COLS["month"], "")
+        if isinstance(m_raw, (int, float)) and not isinstance(m_raw, bool):
+            month = _sheet_date(m_raw).strftime("%Y-%m")         # Sheets turned "2026-10" into a date
+        elif str(m_raw).strip():
+            month = str(m_raw).strip()[:7]
+        else:
+            month = d.strftime("%Y-%m") if d is not None else None
+        if errs:
+            issues.append({"row": n, "problem": "; ".join(errs)})
+            continue
+        good.append(dict(row=n, date=d, symbol=sym, side=side, qty=int(qty), price=price,
+                         charges=ch or 0.0, month=month,
+                         order_id=str(row.get(TRADE_COLS["order_id"], "")).strip(),
+                         notes=str(row.get(TRADE_COLS["notes"], "")).strip()))
+    good.sort(key=lambda t: (t["date"], t["row"]))
+    return good, issues
+
+
+def parse_cash(c_rows):
+    good, issues = [], []
+    for row in c_rows or []:
+        d = _sheet_date(row.get(CASH_COLS["date"], ""))
+        typ = str(row.get(CASH_COLS["type"], "")).strip().title()
+        amt = _num(row.get(CASH_COLS["amount"]))
+        errs = []
+        if d is None:
+            errs.append("Date missing or not a date")
+        if typ not in ("Deposit", "Withdrawal", "Dividend", "Interest"):
+            errs.append(f"Type must be Deposit/Withdrawal/Dividend/Interest (got '{typ}')")
+        if amt is None or amt < 0:
+            errs.append("Amount must be a number ≥ 0")
+        if errs:
+            issues.append({"row": row["_row"], "problem": "Cash tab: " + "; ".join(errs)})
+            continue
+        good.append(dict(date=d, type=typ, amount=amt, notes=str(row.get(CASH_COLS["notes"], "")).strip()))
+    return good, issues
+
+
+def build_account(trades, cash_moves, issues):
+    """Average-cost holdings, realised/unrealised P&L (after charges), cash and plan vs actual."""
+    held = {}                                   # sym -> {"qty", "cost"} (cost includes buy charges)
+    realised = charges = 0.0
+    for t in trades:
+        h = held.setdefault(t["symbol"], {"qty": 0, "cost": 0.0})
+        charges += t["charges"]
+        if t["side"] == "BUY":
+            h["qty"] += t["qty"]
+            h["cost"] += t["qty"] * t["price"] + t["charges"]
+        else:
+            if t["qty"] > h["qty"]:
+                issues.append({"row": t["row"], "problem": f"SELL {t['qty']} {t['symbol']} is more than the "
+                                                          f"{h['qty']} held at that point — row ignored"})
+                charges -= t["charges"]
+                continue
+            avg = h["cost"] / h["qty"]
+            realised += t["qty"] * t["price"] - t["charges"] - avg * t["qty"]
+            h["cost"] -= avg * t["qty"]
+            h["qty"] -= t["qty"]
+    strat_pos = live_state["positions"]
+    holdings = []
+    for sym in sorted(set(held) | set(strat_pos), key=lambda s: (cur_rank.get(s, 999), s)):
+        h = held.get(sym, {"qty": 0, "cost": 0.0})
+        price = px(sym, AS_OF) if sym in SYMBOLS else None
+        value = h["qty"] * price if price is not None else None
+        avg = h["cost"] / h["qty"] if h["qty"] else None
+        sq = strat_pos[sym]["qty"] if sym in strat_pos else 0
+        if h["qty"] == 0 and sq == 0:
+            continue
+        holdings.append(dict(
+            symbol=sym, category=CATEGORY.get(sym, ""), qty=h["qty"], avg_cost=avg, invested=h["cost"],
+            price=price, value=value,
+            upnl=(value - h["cost"]) if value is not None and h["qty"] else None,
+            upnl_pct=((value / h["cost"] - 1) * 100) if value is not None and h["cost"] else None,
+            strategy_qty=sq, qty_diff=h["qty"] - sq,
+            status=("MATCH" if h["qty"] == sq else "NOT IN STRATEGY" if sq == 0
+                    else "NOT HELD" if h["qty"] == 0 else "QTY DIFF")))
+    deposits = sum(c["amount"] for c in cash_moves if c["type"] == "Deposit")
+    withdrawals = sum(c["amount"] for c in cash_moves if c["type"] == "Withdrawal")
+    income = sum(c["amount"] for c in cash_moves if c["type"] in ("Dividend", "Interest"))
+    capital_assumed = deposits == 0
+    capital = (deposits - withdrawals) if not capital_assumed else float(INITIAL_CAPITAL)
+    trade_cash = sum((-(t["qty"] * t["price"] + t["charges"]) if t["side"] == "BUY"
+                      else t["qty"] * t["price"] - t["charges"]) for t in trades
+                     if not any(i["row"] == t["row"] for i in issues))
+    cash_bal = capital + income + trade_cash
+    mv = sum(h["value"] for h in holdings if h["value"] is not None and h["qty"])
+    invested_open = sum(h["invested"] for h in holdings if h["qty"])
+    upnl = sum(h["upnl"] for h in holdings if h["upnl"] is not None)
+    acct_value = mv + cash_bal
+    pnl = acct_value - capital
+    # Plan vs actual for every recorded live entry day (strategy plan = recorded at that day's close)
+    pva = []
+    if live_started:
+        for m in live["monthly"]:
+            ed, month = m["rebal_date"], m["rebal_date"].strftime("%Y-%m")
+            plan = {(a["symbol"], a["action"]): a for a in live["log"]
+                    if a["date"] == ed.date() and a["action"] in ("BUY", "SELL")}
+            actual = {}
+            for t in trades:
+                if t["month"] == month:
+                    k = (t["symbol"], t["side"])
+                    x = actual.setdefault(k, {"qty": 0, "value": 0.0, "charges": 0.0})
+                    x["qty"] += t["qty"]
+                    x["value"] += t["qty"] * t["price"]
+                    x["charges"] += t["charges"]
+            for (sym, side) in sorted(set(plan) | set(actual), key=lambda k: (k[1], cur_rank.get(k[0], 999))):
+                p, a = plan.get((sym, side)), actual.get((sym, side))
+                a_avg = a["value"] / a["qty"] if a else None
+                status = ("NOT DONE" if a is None else "NOT IN PLAN" if p is None
+                          else "MATCH" if a["qty"] == p["qty"] else f"QTY DIFF ({a['qty'] - p['qty']:+d})")
+                pva.append(dict(month=month, entry_day=ed.date(), symbol=sym, side=side,
+                                plan_qty=p["qty"] if p else None, plan_price=p["price"] if p else None,
+                                actual_qty=a["qty"] if a else None, actual_avg=a_avg,
+                                charges=a["charges"] if a else None,
+                                price_diff_pct=((a_avg / p["price"] - 1) * 100) if p and a else None,
+                                status=status))
+    latest_month = pva[-1]["month"] if pva else None
+    latest = [r for r in pva if r["month"] == latest_month]
+    return dict(
+        holdings=holdings, pva=pva, latest_month=latest_month,
+        latest_mismatches=sum(r["status"] != "MATCH" for r in latest),
+        latest_entered=any(r["actual_qty"] for r in latest),
+        capital=capital, capital_assumed=capital_assumed, deposits=deposits, withdrawals=withdrawals,
+        income=income, cash=cash_bal, market_value=mv, invested=invested_open, upnl=upnl,
+        realised=realised, charges=charges, value=acct_value, pnl=pnl,
+        ret_pct=pnl / capital * 100 if capital else None)
+
+
+_t_rows, _c_rows, account_error = read_trade_sheet()
+account = None
+account_trades, account_cash, account_issues = [], [], []
+if account_error is None:
+    account_trades, account_issues = parse_trades(_t_rows)
+    account_cash, _cash_issues = parse_cash(_c_rows)
+    account_issues += _cash_issues
+    account = build_account(account_trades, account_cash, account_issues)
+    print(f"  [MY ACCOUNT] Google Sheet: {len(account_trades)} trade row(s), {len(account_cash)} cash row(s), "
+          f"{len(account_issues)} problem row(s) · value ₹{account['value']:,.0f} ({account['ret_pct']:+.2f}%)")
+elif account_error == "not configured":
+    print("  [MY ACCOUNT] Google Sheet not configured — skipped")
+else:
+    print(f"  [MY ACCOUNT] Could not read the Google Sheet: {account_error}")
+
+# ═════════════════════════════════════════════════════════════════════════════
 # EXCEL OUTPUT — Live_* sheets first, historical reference as Hist_* sheets
 # ═════════════════════════════════════════════════════════════════════════════
 live_summary_df = pd.DataFrame([
@@ -1180,6 +1443,51 @@ except PermissionError:
     EXCEL_PATH = EXCEL_PATH.with_name(f"{EXCEL_PATH.stem}_{now_ist():%Y%m%d_%H%M%S}{EXCEL_PATH.suffix}")
     print(f"  [warn] {_locked.name} is open in another program — saving to {EXCEL_PATH.name} instead")
 
+# My Account sheets (only when the Google Sheet was read successfully)
+my_xl = {}
+if account is not None:
+    my_xl["My_Account"] = pd.DataFrame([
+        ("Source", "Google Sheet 'ETF Momentum – My Trades' (read-only)"),
+        ("Read at", now_ist().strftime("%Y-%m-%d %H:%M IST")),
+        ("Prices as of", str(AS_OF.date())),
+        ("Capital", round(account["capital"], 2)),
+        ("Capital basis", "assumed INITIAL_CAPITAL (no Deposit rows in Cash tab)" if account["capital_assumed"]
+         else "Cash tab deposits − withdrawals"),
+        ("Account Value", round(account["value"], 2)),
+        ("Total P&L", round(account["pnl"], 2)),
+        ("Return %", round(account["ret_pct"], 2)),
+        ("Market Value (holdings)", round(account["market_value"], 2)),
+        ("Invested (open cost incl. charges)", round(account["invested"], 2)),
+        ("Unrealised P&L", round(account["upnl"], 2)),
+        ("Realised P&L", round(account["realised"], 2)),
+        ("Total Charges", round(account["charges"], 2)),
+        ("Cash", round(account["cash"], 2)),
+        ("Dividends + Interest", round(account["income"], 2)),
+        ("Trade rows read", len(account_trades)),
+        ("Problem rows", len(account_issues)),
+    ], columns=["Metric", "Value"])
+    my_xl["My_Holdings"] = pd.DataFrame([{
+        "Symbol": h["symbol"], "Category": h["category"], "My Qty": h["qty"],
+        "Avg Cost (incl. charges)": h["avg_cost"], "Invested": h["invested"], "Price": h["price"],
+        "Value": h["value"], "Unrealised P&L": h["upnl"], "Unrealised P&L %": h["upnl_pct"],
+        "Strategy Qty": h["strategy_qty"], "Qty Diff": h["qty_diff"], "Status": h["status"],
+    } for h in account["holdings"]]).round(4)
+    my_xl["My_Plan_vs_Actual"] = pd.DataFrame([{
+        "Month": r["month"], "Entry Day": r["entry_day"], "Symbol": r["symbol"], "Side": r["side"],
+        "Plan Qty": r["plan_qty"], "Plan Price (close)": r["plan_price"], "Actual Qty": r["actual_qty"],
+        "Actual Avg Price": r["actual_avg"], "Charges": r["charges"], "Price Diff %": r["price_diff_pct"],
+        "Status": r["status"],
+    } for r in account["pva"]]).round(4)
+    my_xl["My_Trades"] = pd.DataFrame([{
+        "Sheet Row": t["row"], "Trade Date": t["date"].date(), "Symbol": t["symbol"], "Side": t["side"],
+        "Quantity": t["qty"], "Price": t["price"], "Charges": t["charges"], "Entry Month": t["month"],
+        "Order ID": t["order_id"], "Notes": t["notes"], "Value": t["qty"] * t["price"],
+    } for t in account_trades] + [{"Sheet Row": i["row"], "Notes": "PROBLEM: " + i["problem"]}
+                                   for i in account_issues])
+    my_xl["My_Cash"] = pd.DataFrame([{"Date": c["date"].date(), "Type": c["type"], "Amount": c["amount"],
+                                      "Notes": c["notes"]} for c in account_cash])
+
+
 def _write_excel():
     with pd.ExcelWriter(EXCEL_PATH, engine="openpyxl") as xw:
         live_summary_df.to_excel(xw, sheet_name="Live_Summary", index=False)
@@ -1187,6 +1495,8 @@ def _write_excel():
         _or_empty(live_act_xl, "action").to_excel(xw, sheet_name="Live_Actions", index=False)
         live_sig_xl.to_excel(xw, sheet_name="Live_Signals", index=False)
         live_data_xl.to_excel(xw, sheet_name="Live_Data_Status", index=False)
+        for _name, _df in my_xl.items():
+            _or_empty(_df, "Notes").to_excel(xw, sheet_name=_name, index=False)
         _or_empty(live_trades_df, "trade_id").to_excel(xw, sheet_name="Live_Closed_Trades", index=False)
         live_eq_xl.to_excel(xw, sheet_name="Live_Equity", index=False)
         _or_empty(live_monthly_xl, "rebal_date").to_excel(xw, sheet_name="Live_Rebalances", index=False)
@@ -1369,6 +1679,61 @@ if near_miss:
 act_data_warn = ("" if not (stale_actions or stale_signal or market_delayed) else
                  "<div class='datawarn slim'>⚠ Some prices behind these actions are delayed — "
                  "see the data warning at the top. Actions may change after the data catches up.</div>")
+
+# ── My Account (real trades from the Google Sheet) ──────────────────────────
+if account is None:
+    account_html = ("<p class='muted'>" + ("Google Sheet not connected (add GSHEET_ID and "
+                    "GOOGLE_SERVICE_ACCOUNT_JSON secrets, or local_config.json locally)." if account_error == "not configured"
+                    else f"⚠ Could not read the Google Sheet: {htmlmod.escape(str(account_error))}") + "</p>")
+else:
+    _a = account
+    _acct_kpis = "".join([
+        kpi("Account Value", inr(_a["value"])),
+        kpi("Total P&L", inr(_a["pnl"]), pn(_a["pnl"])),
+        kpi("Return %", pct(_a["ret_pct"]), pn(_a["ret_pct"])),
+        kpi("Market Value", inr(_a["market_value"])),
+        kpi("Invested (open)", inr(_a["invested"])),
+        kpi("Unrealised P&L", inr(_a["upnl"]), pn(_a["upnl"])),
+        kpi("Realised P&L", inr(_a["realised"]), pn(_a["realised"])),
+        kpi("Charges Paid", inr(_a["charges"], 2)),
+        kpi("Cash", inr(_a["cash"])),
+    ])
+    _hold_cols = [
+        ("symbol", "Symbol", None), ("category", "Category", None), ("qty", "My Qty", str),
+        ("avg_cost", "Avg Cost (incl. charges)", num), ("invested", "Invested", inr),
+        ("price", f"Price ({AS_OF.date()})", num), ("value", "Value", inr), ("upnl", "Unrealised P&L ₹", inr),
+        ("upnl_pct", "Unrealised P&L %", pct), ("strategy_qty", "Strategy Qty", str),
+        ("qty_diff", "Diff", lambda v: f"{v:+d}" if v else "0"), ("status", "Status", None),
+    ]
+    _pva_cols = [
+        ("month", "Month", None), ("symbol", "Symbol", None), ("side", "Side", None),
+        ("plan_qty", "Plan Qty", lambda v: "—" if v is None else str(v)),
+        ("plan_price", "Plan Price (close)", num),
+        ("actual_qty", "Actual Qty", lambda v: "—" if v is None else str(v)),
+        ("actual_avg", "Actual Avg Price", num), ("charges", "Charges ₹", lambda v: inr(v, 2)),
+        ("price_diff_pct", "Price vs Close", pct), ("status", "Status", None),
+    ]
+    _ok = lambda r: "pos" if r["status"] == "MATCH" else "warn"
+    _issues_html = ("" if not account_issues else
+                    "<div class='datawarn slim'>⚠ <b>Sheet rows with problems</b> (not used until fixed): "
+                    + "; ".join(f"row {i['row']}: {htmlmod.escape(i['problem'])}" for i in account_issues) + "</div>")
+    _cap_note = (" Capital assumed " + inr(_a["capital"]) + " — add a Deposit row in the Cash tab to set it."
+                 if _a["capital_assumed"] else "")
+    _latest_note = ("" if not _a["latest_month"] else
+                    f" Latest entry month {_a['latest_month']}: "
+                    + ("no trades entered yet." if not _a["latest_entered"] else
+                       "✓ matches the strategy plan." if _a["latest_mismatches"] == 0 else
+                       f"⚠ {_a['latest_mismatches']} difference(s) from the strategy plan."))
+    account_html = f"""
+<p class='muted'>From your Google Sheet: {len(account_trades)} trade row(s), {len(account_cash)} cash row(s), read
+{now_ist():%Y-%m-%d %H:%M} IST. Prices = {AS_OF.date()} close; P&L after charges (average-cost method).{_cap_note}{_latest_note}</p>
+{_issues_html}
+<div class="kpis">{_acct_kpis}</div>
+<h3>My holdings vs strategy</h3>
+{table(_a["holdings"], _hold_cols, "tMyHold", _ok, lambda k, r: pn(r[k]) if k in ("upnl", "upnl_pct") else ("sym" if k == "symbol" else ""))}
+<h3>Plan vs actual (each entry day)</h3>
+<p class='muted'>Plan = the strategy record at the entry-day close; actual = your fills for that month in the sheet.</p>
+{table(_a["pva"], _pva_cols, "tPva", _ok, lambda k, r: pn(-r[k]) if k == "price_diff_pct" and r.get("side") == "BUY" and r[k] is not None else ("sym" if k == "symbol" else ""))}"""
 
 # ── Header / KPI cards ───────────────────────────────────────────────────────
 live_start_label = str(live_init_date.date()) if live_started else LIVE_START_DATE
@@ -1826,6 +2191,9 @@ document.addEventListener('toggle', resizeCharts, true);
 amber = exit risk (stop hit, outside top 6, or within {NEAR_STOP_PCT:.0f}% of a stop). Click a header to sort.</p>
 {positions_html}
 
+<h2>My Account — real trades (Google Sheet)</h2>
+{account_html}
+
 <h2>Risk Monitor</h2>
 <p class='muted'>Sorted by the position closest to an exit. Peak includes the latest close.</p>
 {risk_html}
@@ -1922,6 +2290,18 @@ summary = {
     "actions": {k: [{f: a.get(f) for f in ("symbol", "rank", "qty", "price", "signal_price", "value",
                                            "target", "reason", "pnl_pct")} for a in v]
                 for k, v in acts.items()},
+    "account": None if account is None else {
+        "value": account["value"], "pnl": account["pnl"], "ret_pct": account["ret_pct"],
+        "cash": account["cash"], "charges": account["charges"], "realised": account["realised"],
+        "upnl": account["upnl"], "capital": account["capital"], "capital_assumed": account["capital_assumed"],
+        "trades": len(account_trades), "issues": account_issues,
+        "latest_month": account["latest_month"], "latest_entered": account["latest_entered"],
+        "latest_mismatches": account["latest_mismatches"],
+        "latest_pva": [r for r in account["pva"] if r["month"] == account["latest_month"]],
+        "holdings": [{k: h[k] for k in ("symbol", "qty", "avg_cost", "value", "upnl", "upnl_pct",
+                                         "strategy_qty", "status")} for h in account["holdings"]],
+    },
+    "account_error": account_error,
     "data": {
         "status": data_status,
         "etfs_loaded": len(SYMBOLS), "universe": len(UNIVERSE),

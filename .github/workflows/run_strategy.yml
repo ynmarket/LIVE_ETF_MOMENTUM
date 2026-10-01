@@ -51,6 +51,9 @@ jobs:
         id: run
         env:
           PYTHONUNBUFFERED: "1"
+          # "My Account": read-only access to the Google Sheet of real trades
+          GSHEET_ID: ${{ secrets.GSHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
           set +e
           python ETF_Momentum_Test_1.py --force
