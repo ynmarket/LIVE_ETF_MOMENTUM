@@ -150,8 +150,9 @@ CATEGORY = dict(UNIVERSE)
 # ═════════════════════════════════════════════════════════════════════════════
 # DATA DOWNLOAD
 # ═════════════════════════════════════════════════════════════════════════════
-def fetch_close(yf_symbol, start, end):
-    """Download daily Close for one symbol; returns a clean Series (may be empty)."""
+def fetch_close(yf_symbol, start, end, volume_out=None):
+    """Download daily Close for one symbol; returns a clean Series (may be empty).
+    volume_out (dict): if given, the symbol's daily Volume series is stored in it as well."""
     try:
         df = yf.download(yf_symbol, start=start, end=end, progress=False, threads=False)
     except Exception:
@@ -169,6 +170,13 @@ def fetch_close(yf_symbol, start, end):
     s = s[s > 0]
     s.index = pd.to_datetime(s.index).tz_localize(None).normalize()
     s = s[~s.index.duplicated(keep="last")].sort_index()
+    if volume_out is not None and "Volume" in df.columns:
+        v = df["Volume"]
+        if isinstance(v, pd.DataFrame):
+            v = v.iloc[:, 0]
+        v = pd.to_numeric(v, errors="coerce").fillna(0)
+        v.index = pd.to_datetime(v.index).tz_localize(None).normalize()
+        volume_out[yf_symbol] = v[~v.index.duplicated(keep="last")].sort_index()
     return s
 
 
@@ -196,11 +204,34 @@ print(f"Downloading data for {len(UNIVERSE)} ETFs..."
 raw = {}
 dropped = []
 dropped_info = {}                       # symbol -> rows received (for the data-status report)
+_fetched, _volumes = {}, {}
 for nse, _cat in UNIVERSE:
-    s = fetch_close(f"{nse}.NS", dl_start, dl_end)
+    s = fetch_close(f"{nse}.NS", dl_start, dl_end, volume_out=_volumes)
     if MARKET_HOURS and not s.empty and s.index[-1] >= TODAY_TS:
         live_quotes[nse] = float(s.iloc[-1])
         s = s[s.index < TODAY_TS]
+    _fetched[nse] = s
+
+# ── Market session calendar (data handling only) ─────────────────────────────
+# On exchange holidays Yahoo inserts placeholder bars (volume 0, prices = previous close, e.g.
+# 2026-05-01). They are not trading sessions and must not become entry days. A date counts as a
+# real session if at least one ETF in the universe traded on it (volume > 0); a few illiquid ETFs
+# report volume 0 every day, so volume is judged across the whole universe, never per ETF.
+SESSION_DATES = set()
+for _v in _volumes.values():
+    SESSION_DATES |= set(_v.index[_v > 0])
+_all_bar_dates = set().union(*[s.index for s in _fetched.values() if not s.empty])
+HOLIDAY_PLACEHOLDERS = sorted(_all_bar_dates - SESSION_DATES) if SESSION_DATES else []
+if HOLIDAY_PLACEHOLDERS:
+    print(f"Market calendar: removed {len(HOLIDAY_PLACEHOLDERS)} holiday placeholder date(s) with no trading "
+          f"in any ETF: " + ", ".join(str(d.date()) for d in HOLIDAY_PLACEHOLDERS))
+elif not SESSION_DATES:
+    print("  [warn] no volume data from Yahoo — holiday placeholder bars cannot be detected")
+
+for nse, _cat in UNIVERSE:
+    s = _fetched[nse]
+    if HOLIDAY_PLACEHOLDERS and not s.empty:
+        s = s[~s.index.isin(HOLIDAY_PLACEHOLDERS)]
     if s.empty:
         print(f"  [warn] {nse}: no yfinance data — skipped")
         dropped.append(nse)
@@ -217,6 +248,8 @@ print(f"{len(raw)} ETFs loaded, {len(dropped)} dropped (insufficient history)")
 bm_raw = fetch_close(BM_SYMBOL, dl_start, dl_end)
 if MARKET_HOURS and not bm_raw.empty:
     bm_raw = bm_raw[bm_raw.index < TODAY_TS]
+if HOLIDAY_PLACEHOLDERS and not bm_raw.empty:
+    bm_raw = bm_raw[~bm_raw.index.isin(HOLIDAY_PLACEHOLDERS)]
 if bm_raw.empty:
     print(f"  [warn] benchmark {BM_SYMBOL}: no data — benchmark comparison disabled")
 
