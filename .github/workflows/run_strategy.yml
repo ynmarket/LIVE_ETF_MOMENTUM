@@ -101,12 +101,20 @@ jobs:
 
       # The summary currently on GitHub Pages = the last successful run. Used only so the
       # Telegram step does not repeat alerts that were already sent.
+      #   With PAGE_PASSWORD set, the published summary is encrypted (summary.json.enc).
       - name: Fetch previously published summary
+        env:
+          PAGE_PASSWORD: ${{ secrets.PAGE_PASSWORD }}
         run: |
           owner="${GITHUB_REPOSITORY_OWNER,,}"; repo="${GITHUB_REPOSITORY#*/}"
-          curl -fsSL --max-time 20 "https://${owner}.github.io/${repo}/summary.json?run=${GITHUB_RUN_ID}" \
-               -o reports/previous_summary.json \
-            || { echo "No previous summary published yet (first run?)"; rm -f reports/previous_summary.json; }
+          base="https://${owner}.github.io/${repo}"
+          if [ -n "$PAGE_PASSWORD" ] && curl -fsSL --max-time 20 "${base}/summary.json.enc?run=${GITHUB_RUN_ID}" -o /tmp/prev.enc; then
+            python page_crypto.py dec /tmp/prev.enc reports/previous_summary.json \
+              || { echo "Previous summary could not be decrypted (password changed?)"; rm -f reports/previous_summary.json; }
+          else
+            curl -fsSL --max-time 20 "${base}/summary.json?run=${GITHUB_RUN_ID}" -o reports/previous_summary.json \
+              || { echo "No previous summary published yet (first run?)"; rm -f reports/previous_summary.json; }
+          fi
 
       - name: Upload report artifact
         if: always()   # keep whatever was generated, even when a step failed
@@ -144,11 +152,22 @@ jobs:
       # ── GitHub Pages: publish the SAME report, unchanged, as public/index.html ──
       # These steps only run when everything above succeeded, so a broken or empty
       # report is never published — the previous good report stays online instead.
+      # With the PAGE_PASSWORD secret set, the page and summary are published ENCRYPTED (password
+      # unlock page); without it they are published as plain files, exactly as before.
       - name: Prepare Pages site
+        env:
+          PAGE_PASSWORD: ${{ secrets.PAGE_PASSWORD }}
         run: |
           mkdir -p public
-          cp reports/ETF_Momentum_Test_1_Report.html public/index.html
-          cp reports/summary.json public/summary.json
+          if [ -n "$PAGE_PASSWORD" ]; then
+            python page_crypto.py page reports/ETF_Momentum_Test_1_Report.html public/index.html
+            python page_crypto.py enc reports/summary.json public/summary.json.enc
+            echo "Published page is password-protected."
+          else
+            cp reports/ETF_Momentum_Test_1_Report.html public/index.html
+            cp reports/summary.json public/summary.json
+            echo "::warning title=Public page::PAGE_PASSWORD secret not set — the dashboard is published without a password."
+          fi
           ls -l public/
 
       - name: Configure Pages

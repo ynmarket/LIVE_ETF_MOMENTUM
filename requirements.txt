@@ -8,3 +8,5 @@ plotly==7.1.0
 # Google Sheet "My Trades" (read-only, service account)
 google-auth==2.59.1
 requests==2.34.2
+# Password-protected GitHub Pages dashboard (page_crypto.py)
+cryptography==50.0.2
