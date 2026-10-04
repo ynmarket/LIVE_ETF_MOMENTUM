@@ -1094,6 +1094,7 @@ print("═" * 60)
 #   GitHub Actions: secrets GSHEET_ID + GOOGLE_SERVICE_ACCOUNT_JSON (passed as environment variables)
 #   Local runs:     local_config.json (git-ignored) {"gsheet_id": ..., "service_account_file": ...}
 LOCAL_CONFIG_PATH = BASE_DIR / "local_config.json"
+XIRR_MIN_DAYS = 30                                # annualising a few days' return is meaningless
 SHEET_EPOCH = datetime(1899, 12, 30)              # Google Sheets serial-date day 0
 TRADE_COLS = {"date": "Trade Date", "symbol": "Symbol", "side": "Side", "qty": "Quantity",
               "price": "Price", "charges": "Charges ₹", "month": "Entry Month", "order_id": "Order ID",
@@ -1243,10 +1244,75 @@ def parse_cash(c_rows):
     return good, issues
 
 
+def _xirr(flows):
+    """Annualised money-weighted return (%) of dated cash flows [(date, amount)], investor's view:
+    money in = negative, money out / today's value = positive. None if it cannot be solved."""
+    flows = [(d, a) for d, a in flows if a]
+    if len(flows) < 2 or not any(a > 0 for _, a in flows) or not any(a < 0 for _, a in flows):
+        return None
+    t0 = min(d for d, _ in flows)
+
+    def npv(r):
+        return sum(a / (1 + r) ** ((d - t0).days / 365.0) for d, a in flows)
+
+    lo, hi = -0.9999, 10.0
+    f_lo = npv(lo)
+    if f_lo * npv(hi) > 0:
+        return None
+    mid = lo
+    for _ in range(200):                         # bisection: robust, no extra packages
+        mid = (lo + hi) / 2
+        f = npv(mid)
+        if abs(f) < 1e-7:
+            break
+        if f_lo * f < 0:
+            hi = mid
+        else:
+            lo, f_lo = mid, f
+    return mid * 100
+
+
+def _account_daily(accepted, cash_moves, capital_assumed, start):
+    """Daily account value from START (cash + holdings at each close) and a TIME-WEIGHTED index
+    (deposits/withdrawals do not count as performance). Returns (rows, symbols without prices)."""
+    ext = ([(start, float(INITIAL_CAPITAL))] if capital_assumed else
+           [(c["date"], c["amount"] if c["type"] == "Deposit" else -c["amount"])
+            for c in cash_moves if c["type"] in ("Deposit", "Withdrawal")])
+    income = [(c["date"], c["amount"]) for c in cash_moves if c["type"] in ("Dividend", "Interest")]
+    rows, missing = [], set()
+    prev_cum, prev_v, idx = 0.0, None, 100.0
+    for d in cal[(cal >= start) & (cal <= AS_OF)]:
+        held, tcash = {}, 0.0
+        for t in accepted:
+            if t["date"] <= d:
+                held[t["symbol"]] = held.get(t["symbol"], 0) + (t["qty"] if t["side"] == "BUY" else -t["qty"])
+                tcash += (-(t["qty"] * t["price"] + t["charges"]) if t["side"] == "BUY"
+                          else t["qty"] * t["price"] - t["charges"])
+        hv = 0.0
+        for sym, q in held.items():
+            if q:
+                if sym in SYMBOLS:
+                    hv += q * px(sym, d)
+                else:
+                    missing.add(sym)
+        cum = sum(a for dd, a in ext if dd <= d)
+        v = cum + sum(a for dd, a in income if dd <= d) + tcash + hv
+        f = cum - prev_cum                           # money added (−withdrawn) since the previous close
+        if prev_v is None:
+            r = v / f - 1 if f else 0.0              # first day: return on the money put in
+        else:
+            r = (v - f) / prev_v - 1 if prev_v else 0.0
+        idx *= 1 + r
+        rows.append(dict(date=d, value=v, flow=f, idx=idx))
+        prev_cum, prev_v = cum, v
+    return rows, missing
+
+
 def build_account(trades, cash_moves, issues):
     """Average-cost holdings, realised/unrealised P&L (after charges), cash and plan vs actual."""
     held = {}                                   # sym -> {"qty", "cost"} (cost includes buy charges)
     realised = charges = 0.0
+    ignored_rows = set()
     for t in trades:
         h = held.setdefault(t["symbol"], {"qty": 0, "cost": 0.0})
         charges += t["charges"]
@@ -1258,6 +1324,7 @@ def build_account(trades, cash_moves, issues):
                 issues.append({"row": t["row"], "problem": f"SELL {t['qty']} {t['symbol']} is more than the "
                                                           f"{h['qty']} held at that point — row ignored"})
                 charges -= t["charges"]
+                ignored_rows.add(t["row"])
                 continue
             avg = h["cost"] / h["qty"]
             realised += t["qty"] * t["price"] - t["charges"] - avg * t["qty"]
@@ -1294,6 +1361,7 @@ def build_account(trades, cash_moves, issues):
     invested_open = sum(h["invested"] for h in holdings if h["qty"])
     upnl = sum(h["upnl"] for h in holdings if h["upnl"] is not None)
     acct_value = mv + cash_bal
+    acct_value_now = acct_value
     pnl = acct_value - capital
     # Plan vs actual for every recorded live entry day (strategy plan = recorded at that day's close)
     pva = []
@@ -1315,15 +1383,66 @@ def build_account(trades, cash_moves, issues):
                 a_avg = a["value"] / a["qty"] if a else None
                 status = ("NOT DONE" if a is None else "NOT IN PLAN" if p is None
                           else "MATCH" if a["qty"] == p["qty"] else f"QTY DIFF ({a['qty'] - p['qty']:+d})")
+                # Execution vs the strategy close, in ₹ (+ = cost: bought higher / sold lower; − = saved)
+                slip = ((a_avg - p["price"]) * a["qty"] * (1 if side == "BUY" else -1)) if p and a else None
                 pva.append(dict(month=month, entry_day=ed.date(), symbol=sym, side=side,
                                 plan_qty=p["qty"] if p else None, plan_price=p["price"] if p else None,
                                 actual_qty=a["qty"] if a else None, actual_avg=a_avg,
                                 charges=a["charges"] if a else None,
                                 price_diff_pct=((a_avg / p["price"] - 1) * 100) if p and a else None,
+                                slippage=slip, traded_value=a["value"] if a else None,
                                 status=status))
     latest_month = pva[-1]["month"] if pva else None
     latest = [r for r in pva if r["month"] == latest_month]
+
+    # H — execution cost by entry month (only trades that match a planned action)
+    exec_months, cum = [], 0.0
+    for month in sorted({r["month"] for r in pva}):
+        mr = [r for r in pva if r["month"] == month and r["slippage"] is not None]
+        if not mr:
+            continue
+        val = sum(r["traded_value"] for r in mr)
+        slip = sum(r["slippage"] for r in mr)
+        chg = sum(r["charges"] or 0.0 for r in mr)
+        cum += slip + chg
+        exec_months.append(dict(month=month, trades=len(mr), traded_value=val, slippage=slip, charges=chg,
+                                total=slip + chg, total_pct=(slip + chg) / val * 100 if val else None,
+                                cumulative=cum,
+                                unmatched=sum(1 for r in pva if r["month"] == month and r["slippage"] is None)))
+
+    # E — XIRR (money-weighted, annualised) and F — time-weighted comparison since the start
+    accepted = [t for t in trades if t["row"] not in ignored_rows]
+    deposits_ = sum(c["amount"] for c in cash_moves if c["type"] == "Deposit")
+    starts = [t["date"] for t in accepted] + [c["date"] for c in cash_moves if c["type"] == "Deposit"]
+    start = min(starts) if starts else None
+    xirr = xirr_days = None
+    daily, perf, unpriced = [], None, set()
+    if start is not None:
+        xirr_flows = ([(start, -float(INITIAL_CAPITAL))] if deposits_ == 0 else
+                      [(c["date"], -c["amount"] if c["type"] == "Deposit" else c["amount"])
+                       for c in cash_moves if c["type"] in ("Deposit", "Withdrawal")])
+        xirr_days = (AS_OF - start).days
+        xirr = _xirr(xirr_flows + [(AS_OF, acct_value_now)]) if xirr_days >= XIRR_MIN_DAYS else None
+        daily, unpriced = _account_daily(accepted, cash_moves, deposits_ == 0, start)
+        if daily:
+            dts = pd.DatetimeIndex([r["date"] for r in daily])
+            strat = (live_daily["value"].reindex(dts, method="ffill") / INITIAL_CAPITAL * 100).fillna(100.0) \
+                if live_started else pd.Series(100.0, index=dts)
+            nifty = None
+            if not bm_raw.empty:
+                b = bm_raw.reindex(dts, method="ffill")
+                if b.notna().all():
+                    nifty = b / b.iloc[0] * 100
+            for i, r in enumerate(daily):
+                r["strategy_idx"] = float(strat.iloc[i])
+                r["nifty_idx"] = float(nifty.iloc[i]) if nifty is not None else None
+            last = daily[-1]
+            perf = dict(start=start.date(), account_pct=last["idx"] - 100, strategy_pct=last["strategy_idx"] - 100,
+                        nifty_pct=(last["nifty_idx"] - 100) if last["nifty_idx"] is not None else None)
+
     return dict(
+        xirr=xirr, xirr_days=xirr_days, perf=perf, daily=daily, unpriced=sorted(unpriced),
+        exec_months=exec_months, exec_total=cum if exec_months else None,
         holdings=holdings, pva=pva, latest_month=latest_month,
         latest_mismatches=sum(r["status"] != "MATCH" for r in latest),
         latest_entered=any(r["actual_qty"] for r in latest),
@@ -1497,6 +1616,15 @@ if account is not None:
         ("Total Charges", round(account["charges"], 2)),
         ("Cash", round(account["cash"], 2)),
         ("Dividends + Interest", round(account["income"], 2)),
+        ("XIRR % (annualised)", round(account["xirr"], 2) if account["xirr"] is not None
+         else f"shown after {XIRR_MIN_DAYS} days ({account['xirr_days'] or 0} so far)"),
+        ("Performance since", str(account["perf"]["start"]) if account["perf"] else "n/a"),
+        ("My account % (time-weighted)", round(account["perf"]["account_pct"], 2) if account["perf"] else "n/a"),
+        ("Strategy record %", round(account["perf"]["strategy_pct"], 2) if account["perf"] else "n/a"),
+        ("Nifty 500 %", round(account["perf"]["nifty_pct"], 2)
+         if account["perf"] and account["perf"]["nifty_pct"] is not None else "n/a"),
+        ("Execution vs close ₹ (+cost / −saved)", round(account["exec_total"], 2)
+         if account["exec_total"] is not None else "n/a"),
         ("Trade rows read", len(account_trades)),
         ("Problem rows", len(account_issues)),
     ], columns=["Metric", "Value"])
@@ -1510,7 +1638,7 @@ if account is not None:
         "Month": r["month"], "Entry Day": r["entry_day"], "Symbol": r["symbol"], "Side": r["side"],
         "Plan Qty": r["plan_qty"], "Plan Price (close)": r["plan_price"], "Actual Qty": r["actual_qty"],
         "Actual Avg Price": r["actual_avg"], "Charges": r["charges"], "Price Diff %": r["price_diff_pct"],
-        "Status": r["status"],
+        "₹ vs Close (+cost/−saved)": r["slippage"], "Status": r["status"],
     } for r in account["pva"]]).round(4)
     my_xl["My_Trades"] = pd.DataFrame([{
         "Sheet Row": t["row"], "Trade Date": t["date"].date(), "Symbol": t["symbol"], "Side": t["side"],
@@ -1518,6 +1646,15 @@ if account is not None:
         "Order ID": t["order_id"], "Notes": t["notes"], "Value": t["qty"] * t["price"],
     } for t in account_trades] + [{"Sheet Row": i["row"], "Notes": "PROBLEM: " + i["problem"]}
                                    for i in account_issues])
+    my_xl["My_Performance"] = pd.DataFrame([{
+        "Date": r["date"].date(), "Account Value": r["value"], "Money In (−Out)": r["flow"],
+        "My Account Index": r["idx"], "Strategy Index": r["strategy_idx"], "Nifty 500 Index": r["nifty_idx"],
+    } for r in account["daily"]]).round(4)
+    my_xl["My_Execution_Cost"] = pd.DataFrame([{
+        "Month": r["month"], "Trades": r["trades"], "Traded Value": r["traded_value"],
+        "Price vs Close ₹": r["slippage"], "Charges ₹": r["charges"], "Total ₹ (+cost/−saved)": r["total"],
+        "Total % of Traded": r["total_pct"], "Cumulative ₹": r["cumulative"], "Unmatched rows": r["unmatched"],
+    } for r in account["exec_months"]]).round(4)
     my_xl["My_Cash"] = pd.DataFrame([{"Date": c["date"].date(), "Type": c["type"], "Amount": c["amount"],
                                       "Notes": c["notes"]} for c in account_cash])
 
@@ -1731,6 +1868,15 @@ else:
         kpi("Realised P&L", inr(_a["realised"]), pn(_a["realised"])),
         kpi("Charges Paid", inr(_a["charges"], 2)),
         kpi("Cash", inr(_a["cash"])),
+        kpi("XIRR (annualised)", pct(_a["xirr"]) if _a["xirr"] is not None else
+            (f"after {XIRR_MIN_DAYS} days" if _a["xirr_days"] is not None else "—"), pn(_a["xirr"])),
+        kpi("vs Nifty 500" + (f" since {_a['perf']['start']}" if _a["perf"] else ""),
+            f"{_a['perf']['account_pct'] - _a['perf']['nifty_pct']:+.2f} pp"
+            if _a["perf"] and _a["perf"]["nifty_pct"] is not None else "—",
+            pn(_a["perf"]["account_pct"] - _a["perf"]["nifty_pct"])
+            if _a["perf"] and _a["perf"]["nifty_pct"] is not None else ""),
+        kpi("Execution vs close", (("saved " if _a["exec_total"] < 0 else "cost ") + inr(abs(_a["exec_total"])))
+            if _a["exec_total"] is not None else "—", pn(-_a["exec_total"]) if _a["exec_total"] is not None else ""),
     ])
     _hold_cols = [
         ("symbol", "Symbol", None), ("category", "Category", None), ("qty", "My Qty", str),
@@ -1745,7 +1891,8 @@ else:
         ("plan_price", "Plan Price (close)", num),
         ("actual_qty", "Actual Qty", lambda v: "—" if v is None else str(v)),
         ("actual_avg", "Actual Avg Price", num), ("charges", "Charges ₹", lambda v: inr(v, 2)),
-        ("price_diff_pct", "Price vs Close", pct), ("status", "Status", None),
+        ("price_diff_pct", "Price vs Close", pct), ("slippage", "₹ vs Close", inr),
+        ("status", "Status", None),
     ]
     _ok = lambda r: "pos" if r["status"] == "MATCH" else "warn"
     _issues_html = ("" if not account_issues else
@@ -1768,6 +1915,40 @@ else:
 <h3>Plan vs actual (each entry day)</h3>
 <p class='muted'>Plan = the strategy record at the entry-day close; actual = your fills for that month in the sheet.</p>
 {table(_a["pva"], _pva_cols, "tPva", _ok, lambda k, r: pn(-r[k]) if k == "price_diff_pct" and r.get("side") == "BUY" and r[k] is not None else ("sym" if k == "symbol" else ""))}"""
+
+if account is not None:
+    _a = account
+    if _a["daily"]:
+        _dd = [r["date"] for r in _a["daily"]]
+        f_acct = go.Figure()
+        f_acct.add_trace(go.Scatter(x=_dd, y=[r["idx"] for r in _a["daily"]], name="My account",
+                                    mode="lines+markers", line=dict(color=GRN, width=2.5)))
+        f_acct.add_trace(go.Scatter(x=_dd, y=[r["strategy_idx"] for r in _a["daily"]], name="Strategy record",
+                                    mode="lines+markers", line=dict(color=AMBER, width=2)))
+        if _a["daily"][0]["nifty_idx"] is not None:
+            f_acct.add_trace(go.Scatter(x=_dd, y=[r["nifty_idx"] for r in _a["daily"]], name="Nifty 500",
+                                        mode="lines+markers", line=dict(color=GRAY, dash="dash")))
+        f_acct.add_hline(y=100, line=dict(color=MUTED, dash="dot", width=1))
+        style(f_acct, f"Growth of 100 since {_a['perf']['start']} — my account (time-weighted) vs strategy vs Nifty 500", 380)
+        f_acct.update_layout(yaxis_title="Index (start = 100)", xaxis_title="Date")
+        _perf = _a["perf"]
+        account_html += f"""
+<h3>My account vs strategy vs Nifty 500</h3>
+<p class='muted'>Since {_perf['start']}: my account {pct(_perf['account_pct'])} · strategy record {pct(_perf['strategy_pct'])}
+· Nifty 500 {pct(_perf['nifty_pct'])}. Account return is time-weighted, so deposits and withdrawals do not count as
+performance. XIRR (money-weighted, annualised) is shown once {XIRR_MIN_DAYS}+ days have passed.
+{"⚠ No price for: " + ", ".join(_a["unpriced"]) + " — valued at 0 in this chart." if _a["unpriced"] else ""}</p>
+<div class='card'>{fig_to_div(f_acct)}</div>"""
+    if _a["exec_months"]:
+        _ex_cols = [("month", "Month", None), ("trades", "Trades", str), ("traded_value", "Traded ₹", inr),
+                    ("slippage", "Price vs close ₹", inr), ("charges", "Charges ₹", lambda v: inr(v, 2)),
+                    ("total", "Total ₹", inr), ("total_pct", "Total % of traded", pct),
+                    ("cumulative", "Cumulative ₹", inr)]
+        account_html += f"""
+<h3>Execution cost vs the strategy close</h3>
+<p class='muted'>For every trade that matches the plan: (your price − strategy close) × quantity for buys, the reverse
+for sells, plus charges. Positive = cost, negative (green) = you saved compared with buying/selling at the close.</p>
+{table(_a["exec_months"], _ex_cols, "tExec", None, lambda k, r: pn(-r[k]) if k in ("slippage", "total", "total_pct", "cumulative") and r[k] is not None else "")}"""
 
 # ── Header / KPI cards ───────────────────────────────────────────────────────
 live_start_label = str(live_init_date.date()) if live_started else LIVE_START_DATE
@@ -2332,6 +2513,9 @@ summary = {
         "latest_month": account["latest_month"], "latest_entered": account["latest_entered"],
         "latest_mismatches": account["latest_mismatches"],
         "latest_pva": [r for r in account["pva"] if r["month"] == account["latest_month"]],
+        "xirr": account["xirr"], "xirr_days": account["xirr_days"], "xirr_min_days": XIRR_MIN_DAYS,
+        "perf": account["perf"], "exec_total": account["exec_total"],
+        "exec_latest": account["exec_months"][-1] if account["exec_months"] else None,
         "holdings": [{k: h[k] for k in ("symbol", "qty", "avg_cost", "value", "upnl", "upnl_pct",
                                          "strategy_qty", "status")} for h in account["holdings"]],
     },

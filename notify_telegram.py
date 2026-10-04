@@ -139,6 +139,15 @@ def account_lines(s):
            f"Value <b>{inr(a['value'])}</b> ({pct(a['ret_pct'])}) · P&amp;L {inr(a['pnl'])}",
            f"Unrealised {inr(a['upnl'])} · Realised {inr(a['realised'])} · Charges {inr(a['charges'])} · "
            f"Cash {inr(a['cash'])}"]
+    perf = a.get("perf")
+    if perf:
+        out.append(f"📈 Since {perf['start']}: account {pct(perf['account_pct'])} · strategy "
+                   f"{pct(perf['strategy_pct'])} · Nifty 500 {pct(perf['nifty_pct'])}")
+    if a.get("xirr") is not None:
+        out.append(f"XIRR (annualised): {pct(a['xirr'])}")
+    if a.get("exec_total") is not None:
+        verb = "saved" if a["exec_total"] < 0 else "cost"
+        out.append(f"🧾 Execution vs close: {verb} {inr(abs(a['exec_total']))} (incl. charges)")
     if a.get("latest_month"):
         if not a.get("latest_entered"):
             out.append(f"📝 No trades entered for {a['latest_month']} yet")
