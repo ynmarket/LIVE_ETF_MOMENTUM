@@ -1086,6 +1086,27 @@ print(f"  [Historical reference {first_d.date()}→{LAST_DATE.date()}: CAGR {cag
       f"MaxDD {max_dd_daily:.2f}% | Sharpe {sharpe:.2f}]")
 print("═" * 60)
 
+# ── Ranking trend (reporting only): each ETF's rank on recent entry days + now ──
+# Ranks are the strategy's own momentum ranks on each entry day: the historical backtest for past
+# months and the live record for live months (same rules); "now" = latest close, or the live
+# ranking during the entry-day order plan.
+RANK_TREND_DAYS = 6
+_rank_by_day = {}
+for _r in bt["scores"]:
+    _rank_by_day.setdefault(pd.Timestamp(_r["rebal_date"]), {})[_r["symbol"]] = _r["rank"]
+if live_started:
+    for _d in {pd.Timestamp(_r["rebal_date"]) for _r in live["scores"]}:
+        _rank_by_day[_d] = {_r["symbol"]: _r["rank"] for _r in live["scores"] if pd.Timestamp(_r["rebal_date"]) == _d}
+trend_days = sorted(_rank_by_day)[-RANK_TREND_DAYS:]
+rank_trend = []
+for _sym in cur_ranked:
+    _ranks = [_rank_by_day[_d].get(_sym) for _d in trend_days]
+    _last = next((x for x in reversed(_ranks) if x is not None), None)
+    _now = cur_rank.get(_sym)
+    rank_trend.append(dict(symbol=_sym, category=CATEGORY[_sym], now=_now, ranks=_ranks,
+                           change=(_last - _now) if _last and _now else None,
+                           held=_sym in live_state["positions"]))
+
 # ═════════════════════════════════════════════════════════════════════════════
 # MY ACCOUNT — real trades from the Google Sheet (read-only; never changes the strategy)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1666,6 +1687,13 @@ def _write_excel():
         _or_empty(live_act_xl, "action").to_excel(xw, sheet_name="Live_Actions", index=False)
         live_sig_xl.to_excel(xw, sheet_name="Live_Signals", index=False)
         live_data_xl.to_excel(xw, sheet_name="Live_Data_Status", index=False)
+        pd.DataFrame([{"Symbol": r["symbol"], "Category": r["category"],
+                       **{str(d.date()): rk for d, rk in zip(trend_days, r["ranks"])},
+                       ("Now (live)" if order_plan else f"Now ({AS_OF.date()})"): r["now"],
+                       "Change vs last entry day (+ = up)": r["change"], "Held": "YES" if r["held"] else "NO"}
+                      for r in rank_trend]).apply(
+            lambda c: c.astype("Int64") if c.dtype.kind == "f" else c      # whole-number ranks, blanks kept
+        ).to_excel(xw, sheet_name="Rank_Trend", index=False)
         for _name, _df in my_xl.items():
             _or_empty(_df, "Notes").to_excel(xw, sheet_name=_name, index=False)
         _or_empty(live_trades_df, "trade_id").to_excel(xw, sheet_name="Live_Closed_Trades", index=False)
@@ -2127,6 +2155,30 @@ signals_html = table(
     lambda k, r: ("g" if r[k] else "r") if k == "above_dma" else
     (pn(r[k]) if k in ("r1", "r3", "r6", "r12") else ("sym" if k == "symbol" else "")))
 
+# ── Ranking trend table ──
+_trend_rows = [dict(now=r["now"], symbol=r["symbol"], category=r["category"], change=r["change"],
+                    held=r["held"], **{f"r{i}": rk for i, rk in enumerate(r["ranks"])})
+               for r in rank_trend if (r["now"] or 999) <= 15 or r["held"]]
+_trend_cols = ([("now", "Now" + (" (live)" if order_plan else ""), str), ("symbol", "Symbol", None),
+                ("category", "Category", None)]
+               + [(f"r{i}", d.strftime("%d %b %y"), lambda v: "—" if v is None else str(v))
+                  for i, d in enumerate(trend_days)]
+               + [("change", "Change", lambda v: "—" if v is None else ("↑" if v > 0 else "↓" if v < 0 else "=")
+                   + (str(abs(v)) if v else "")),
+                  ("held", "Held", yn)])
+
+
+def _trend_cell(k, r):
+    v = r.get(k)
+    if k == "change":
+        return pn(v)
+    if (k == "now" or k.startswith("r")) and isinstance(v, int) and v <= N_HOLD:
+        return "t6"
+    return "sym" if k == "symbol" else ""
+
+
+rank_trend_html = table(_trend_rows, _trend_cols, "tTrend", lambda r: "top" if r["held"] else "", _trend_cell)
+
 trade_cols = [
     ("trade_id", "Trade #", str), ("symbol", "Symbol", None), ("category", "Category", None),
     ("entry_date", "Entry Date", None), ("exit_date", "Exit Date", None),
@@ -2320,6 +2372,7 @@ page_html = f"""<!DOCTYPE html>
  .dw-title {{ color:{RD}; font-weight:700; letter-spacing:.5px; }}
  .dataok {{ color:{GRN}; font-size:13px; margin:12px 0 0; }}
  td.stale {{ color:{AMBER}; font-weight:600; }}
+ td.t6 {{ color:{BLUE}; font-weight:700; }}
  .note {{ background:#3B2F10; border:1px solid {AMBER}; border-radius:8px; padding:10px 14px; margin:14px 0; }}
  .kpis {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin:14px 0; }}
  .kpi {{ background:{PANEL}; border-radius:10px; padding:12px 16px; }}
@@ -2418,6 +2471,11 @@ amber = exit risk (stop hit, outside top 6, or within {NEAR_STOP_PCT:.0f}% of a 
 {AS_OF.date()} close{" (not the final signal)" if signal_status == "PENDING" else ""}. Top {N_HOLD} are highlighted. Target allocation
 = current portfolio value / {N_HOLD} = {inr(target_now)}.</p>
 {signals_html}
+
+<h2>Ranking Trend</h2>
+<p class='muted'>Momentum rank on the last {len(trend_days)} entry days and now (top {N_HOLD} in blue). Change = rank
+movement since the last entry day (↑ = moved up). Shows the current top 15 plus anything you hold.</p>
+{rank_trend_html}
 
 <h2>Live Performance</h2>
 <div class="kpis">{kpis_perf}</div>
