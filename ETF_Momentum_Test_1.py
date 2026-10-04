@@ -138,9 +138,10 @@ UNIVERSE = [
     ("DIVOPPBEES", "Thematic"), ("EVINDIA", "Thematic"), ("INTERNET", "Thematic"), ("MNC", "Thematic"),
     ("SELECTIPO", "Thematic"), ("TOP10ADD", "Thematic"),
     ("LOWVOLIETF", "Factor"), ("NV20IETF", "Factor"), ("QUAL30IETF", "Factor"), ("NIFTYQLITY", "Factor"),
-    ("MONQ50", "Factor"), ("HDFCGROWTH", "Factor"), ("MOM50", "Factor"), ("MOMENTUM50", "Factor"),
+    ("HDFCGROWTH", "Factor"), ("MOM50", "Factor"), ("MOMENTUM50", "Factor"),
     ("MOVALUE", "Factor"),
-    ("MON100", "International"), ("MAFANG", "International"), ("HNGSNGBEES", "International"),
+    ("MON100", "International"), ("MONQ50", "International"),    # Motilal Oswal Nasdaq Q 50 ETF
+    ("MAFANG", "International"), ("HNGSNGBEES", "International"),
     ("GOLDBEES", "Gold_Silver"), ("SILVERBEES", "Gold_Silver"),
     ("LTGILTBEES", "Bonds"), ("EBBETF0430", "Bonds"), ("GILT5YBEES", "Bonds"),
 ]
