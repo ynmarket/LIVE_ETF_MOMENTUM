@@ -7,7 +7,8 @@ screen that holds only the encrypted data; the browser decrypts it locally (WebC
 password is typed. summary.json is encrypted the same way (it contains the account numbers).
 
 The password comes from the PAGE_PASSWORD environment variable (a GitHub secret) — never from
-the repository.
+the repository. CRYPTO_PASSWORD, if set, takes precedence; the workflow uses it (with the Telegram
+bot token secret) to encrypt the summary handed from the strategy job to the Telegram job.
 
 Usage:
   python page_crypto.py page  <report.html>   <public/index.html>
@@ -109,9 +110,10 @@ LOADER = r"""<!DOCTYPE html>
 
 
 def _password():
-    pw = os.environ.get("PAGE_PASSWORD", "")
+    """CRYPTO_PASSWORD (used for the private hand-off between workflow jobs) or PAGE_PASSWORD."""
+    pw = os.environ.get("CRYPTO_PASSWORD") or os.environ.get("PAGE_PASSWORD", "")
     if not pw:
-        sys.exit("PAGE_PASSWORD is not set")
+        sys.exit("No password: set PAGE_PASSWORD (or CRYPTO_PASSWORD)")
     return pw
 
 

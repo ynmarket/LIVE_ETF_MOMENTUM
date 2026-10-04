@@ -80,6 +80,11 @@ jobs:
           grep -q "Live Portfolio Dashboard" "$html" || { echo "::error title=HTML generation problem::dashboard title not found in $html"; exit 1; }
           test -f "$xlsx" || { echo "::error title=Excel generation problem::$xlsx was not created"; exit 1; }
           python -c "import json; json.load(open('reports/summary.json'))" || { echo "::error title=Summary file problem::reports/summary.json missing or invalid"; exit 1; }
+          test -f reports/ETF_Momentum_Test_1_Report_public.html || { echo "::error title=HTML generation problem::public page missing"; exit 1; }
+          if grep -q "My Account — real trades" reports/ETF_Momentum_Test_1_Report_public.html; then
+            echo "::error title=Privacy check failed::the public page still contains My Account"; exit 1; fi
+          python -c "import json; s=json.load(open('reports/summary_public.json')); assert 'account' not in s" \
+            || { echo "::error title=Privacy check failed::summary_public.json contains account data"; exit 1; }
           ls -l reports/
 
       # The ETFs chosen on the entry day (live_state/entry_decisions.json) are saved by the script;
@@ -116,18 +121,28 @@ jobs:
               || { echo "No previous summary published yet (first run?)"; rm -f reports/previous_summary.json; }
           fi
 
-      - name: Upload report artifact
-        if: always()   # keep whatever was generated, even when a step failed
+      # PRIVACY: no report, Excel or plain summary is attached to the run (artifacts of a public
+      # repository can be downloaded by any signed-in GitHub user). The Telegram job only receives
+      # the summary ENCRYPTED with the Telegram bot token secret, kept for 1 day.
+      - name: Encrypt summary for the Telegram job
+        if: always()
+        env:
+          CRYPTO_PASSWORD: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          mkdir -p notify
+          if [ -z "$CRYPTO_PASSWORD" ]; then echo "Telegram not configured — nothing to hand over."; exit 0; fi
+          if [ -f reports/summary.json ]; then python page_crypto.py enc reports/summary.json notify/summary.json.enc; fi
+          if [ -f reports/previous_summary.json ]; then python page_crypto.py enc reports/previous_summary.json notify/previous_summary.json.enc; fi
+          ls -l notify/
+
+      - name: Hand over encrypted summary
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: etf-momentum-report
-          path: |
-            reports/ETF_Momentum_Test_1_Report.html
-            reports/ETF_Momentum_Test_1_Report.xlsx
-            reports/summary.json
-            reports/previous_summary.json
-          if-no-files-found: warn
-          retention-days: 30
+          name: notify-data
+          path: notify/
+          if-no-files-found: ignore
+          retention-days: 1
 
       - name: Identify problem
         id: diagnose
@@ -152,8 +167,9 @@ jobs:
       # ── GitHub Pages: publish the SAME report, unchanged, as public/index.html ──
       # These steps only run when everything above succeeded, so a broken or empty
       # report is never published — the previous good report stays online instead.
-      # With the PAGE_PASSWORD secret set, the page and summary are published ENCRYPTED (password
-      # unlock page); without it they are published as plain files, exactly as before.
+      # With the PAGE_PASSWORD secret set, the FULL page and summary are published ENCRYPTED
+      # (password unlock page). Without it, only the public variants are published: the same
+      # dashboard and summary WITHOUT My Account, so real account data is never public.
       - name: Prepare Pages site
         env:
           PAGE_PASSWORD: ${{ secrets.PAGE_PASSWORD }}
@@ -162,11 +178,11 @@ jobs:
           if [ -n "$PAGE_PASSWORD" ]; then
             python page_crypto.py page reports/ETF_Momentum_Test_1_Report.html public/index.html
             python page_crypto.py enc reports/summary.json public/summary.json.enc
-            echo "Published page is password-protected."
+            echo "Published page is password-protected (full dashboard incl. My Account)."
           else
-            cp reports/ETF_Momentum_Test_1_Report.html public/index.html
-            cp reports/summary.json public/summary.json
-            echo "::warning title=Public page::PAGE_PASSWORD secret not set — the dashboard is published without a password."
+            cp reports/ETF_Momentum_Test_1_Report_public.html public/index.html
+            cp reports/summary_public.json public/summary.json
+            echo "::warning title=Public page::PAGE_PASSWORD secret not set — published WITHOUT My Account."
           fi
           ls -l public/
 
@@ -207,12 +223,30 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Download report files
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Install cryptography
+        run: pip install "$(grep -E '^cryptography==' requirements.txt)"
+
+      - name: Download encrypted summary
         continue-on-error: true
         uses: actions/download-artifact@v8
         with:
-          name: etf-momentum-report
-          path: reports
+          name: notify-data
+          path: notify
+
+      - name: Decrypt summary
+        env:
+          CRYPTO_PASSWORD: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          mkdir -p reports
+          if [ -z "$CRYPTO_PASSWORD" ]; then echo "Telegram not configured."; exit 0; fi
+          for f in summary previous_summary; do
+            if [ -f "notify/$f.json.enc" ]; then python page_crypto.py dec "notify/$f.json.enc" "reports/$f.json"; fi
+          done
 
       - name: Send Telegram message
         env:

@@ -1482,7 +1482,8 @@ if account_error is None:
     account_issues += _cash_issues
     account = build_account(account_trades, account_cash, account_issues)
     print(f"  [MY ACCOUNT] Google Sheet: {len(account_trades)} trade row(s), {len(account_cash)} cash row(s), "
-          f"{len(account_issues)} problem row(s) · value ₹{account['value']:,.0f} ({account['ret_pct']:+.2f}%)")
+          f"{len(account_issues)} problem row(s)"
+          + ("" if IN_CI else f" · value ₹{account['value']:,.0f} ({account['ret_pct']:+.2f}%)"))
 elif account_error == "not configured":
     print("  [MY ACCOUNT] Google Sheet not configured — skipped")
 else:
@@ -1743,14 +1744,11 @@ print(f"  → {EXCEL_PATH}")
 BG, PANEL, TXT, MUTED = "#0D1B2A", "#1B2A3A", "#F0F0F0", "#9AA8B6"
 AMBER, GRAY, GRN, RD, BLUE = "#F5A623", "#9E9E9E", "#2ECC71", "#E74C3C", "#5DADE2"
 
-_first_fig = [True]
+PLOTLY_JS = pyo.get_plotlyjs()          # embedded once in <head>: works offline, no CDN
 
 
 def fig_to_div(fig):
     cfg = {"responsive": True, "displaylogo": False}
-    if _first_fig[0]:
-        _first_fig[0] = False
-        return pyo.plot(fig, include_plotlyjs=True, output_type="div", config=cfg)
     return pyo.plot(fig, include_plotlyjs=False, output_type="div", config=cfg)
 
 
@@ -2410,6 +2408,7 @@ page_html = f"""<!DOCTYPE html>
  details.hist summary {{ cursor:pointer; color:{MUTED}; font-weight:600; }}
  @media (max-width:600px) {{ body {{ padding:16px; }} .grid2 {{ grid-template-columns:1fr; }} .kv {{ font-size:20px; }} }}
 </style>
+<script type="text/javascript">{PLOTLY_JS}</script>
 <script>
 function sortTable(id, col) {{
   var t = document.getElementById(id), tb = t.tBodies[0], rows = Array.from(tb.rows);
@@ -2507,6 +2506,23 @@ except Exception as e:
 print(f"Saved: {HTML_PATH.name}")
 print(f"  → {HTML_PATH}")
 
+# Public variant (GitHub Pages without PAGE_PASSWORD): the same page and summary WITHOUT the
+# My Account section — real account data is never published unencrypted.
+PUBLIC_HTML_PATH = OUTPUT_DIR / "ETF_Momentum_Test_1_Report_public.html"
+_acct_block = f"<h2>My Account — real trades (Google Sheet)</h2>\n{account_html}"
+if page_html.count(_acct_block) != 1:
+    print("[HTML ERROR] could not isolate the My Account section for the public page")
+    sys.exit(4)
+_public_html = page_html.replace(_acct_block, "<h2>My Account</h2>\n<p class='muted'>🔒 Hidden on the public "
+                                 "page. Add the PAGE_PASSWORD secret to publish the full, password-protected "
+                                 "dashboard.</p>")
+try:
+    PUBLIC_HTML_PATH.write_text(_public_html, encoding="utf-8")
+except Exception as e:
+    print(f"[HTML ERROR] Could not write {PUBLIC_HTML_PATH}: {e}")
+    sys.exit(4)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # SUMMARY JSON — machine-readable snapshot for notifications (reporting only)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2589,6 +2605,9 @@ summary = {
 }
 try:
     SUMMARY_PATH.write_text(json.dumps(_j(summary), indent=2, ensure_ascii=False), encoding="utf-8")
+    (OUTPUT_DIR / "summary_public.json").write_text(            # public variant: no account data
+        json.dumps(_j({k: v for k, v in summary.items() if k not in ("account", "account_error")}),
+                   indent=2, ensure_ascii=False), encoding="utf-8")
 except Exception as e:
     print(f"[SUMMARY ERROR] Could not write {SUMMARY_PATH}: {e}")
     sys.exit(5)
