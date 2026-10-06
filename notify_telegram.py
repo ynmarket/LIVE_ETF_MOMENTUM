@@ -97,7 +97,8 @@ def footer():
 # ── message builders ─────────────────────────────────────────────────────────
 def msg_summary(s, prev):
     lines = [f"📊 <b>ETF Momentum — Daily Summary</b>",
-             f"Data as of {d(s['as_of'])} · generated {esc(s['generated_ist'])} IST", ""]
+             (f"🟢 Live prices {esc(s['live_quote_time'])} IST (market open) · last close {d(s['as_of'])}"
+              if s.get("live_view") else f"Data as of {d(s['as_of'])}") + f" · generated {esc(s['generated_ist'])} IST", ""]
     if s["live_started"]:
         lines += [f"💼 Value <b>{inr(s['value'])}</b> ({pct(s['ret_pct'])})",
                   f"P&amp;L {inr(s['pnl'])} · Cash {inr(s['cash'])} "
@@ -139,9 +140,10 @@ def account_lines(s):
            f"Value <b>{inr(a['value'])}</b> ({pct(a['ret_pct'])}) · P&amp;L {inr(a['pnl'])}",
            f"Unrealised {inr(a['upnl'])} · Realised {inr(a['realised'])} · Charges {inr(a['charges'])} · "
            f"Cash {inr(a['cash'])}"]
-    perf = a.get("perf")
+    perf = a.get("perf_live") or a.get("perf")
     if perf:
-        out.append(f"📈 Since {perf['start']}: account {pct(perf['account_pct'])} · strategy "
+        live_tag = f" (live {esc(perf['time'])})" if a.get("perf_live") else ""
+        out.append(f"📈 Since {perf['start']}{live_tag}: account {pct(perf['account_pct'])} · strategy "
                    f"{pct(perf['strategy_pct'])} · Nifty 500 {pct(perf['nifty_pct'])}")
     if a.get("xirr") is not None:
         out.append(f"XIRR (annualised): {pct(a['xirr'])}")

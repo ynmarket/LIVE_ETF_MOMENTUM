@@ -247,7 +247,10 @@ for nse, _cat in UNIVERSE:
 print(f"{len(raw)} ETFs loaded, {len(dropped)} dropped (insufficient history)")
 
 bm_raw = fetch_close(BM_SYMBOL, dl_start, dl_end)
+bm_live = None                          # Nifty 500 live value (market hours only)
 if MARKET_HOURS and not bm_raw.empty:
+    if bm_raw.index[-1] >= TODAY_TS:
+        bm_live = float(bm_raw.iloc[-1])
     bm_raw = bm_raw[bm_raw.index < TODAY_TS]
 if HOLIDAY_PLACEHOLDERS and not bm_raw.empty:
     bm_raw = bm_raw[~bm_raw.index.isin(HOLIDAY_PLACEHOLDERS)]
@@ -832,7 +835,23 @@ next_signal, next_signal_known = next_rebal, next_confirmed     # signal and exe
 # entry day's price for the signal (momentum, 200-DMA, ranking, stops) and for the quantities.
 order_plan = bool(MARKET_HOURS and entry_today)
 live_quote_time = _now.strftime("%H:%M") if MARKET_HOURS else None
-live_sc = compute_scores(AS_OF, extra=live_quotes) if order_plan else None
+# LIVE VIEW: during market hours every CURRENT value (positions, P&L, stops, signals/ranking "now",
+# My Account, Telegram) uses today's live price. It is never recorded as a close: the live portfolio
+# record, saved entry decisions, backtest and history charts stay on closing prices.
+LIVE_VIEW = bool(MARKET_HOURS and live_quotes)
+live_sc = compute_scores(AS_OF, extra=live_quotes) if LIVE_VIEW else None
+
+
+def cur_px(sym):
+    """Current price: live quote during market hours (if available), else the latest close."""
+    return float(live_quotes[sym]) if LIVE_VIEW and sym in live_quotes else px(sym, AS_OF)
+
+
+def cur_px_label(sym):
+    """'live HH:MM' for a live quote, else the date of the latest actual close."""
+    if LIVE_VIEW and sym in live_quotes:
+        return f"live {live_quote_time}"
+    return last_px_date[sym].date() if sym in last_px_date else AS_OF.date()
 
 # Live-price completeness: ETFs without a live quote would be ranked on yesterday's close. Up to 2
 # gaps are tolerated only for ETFs that are neither held nor in the live top 10.
@@ -843,8 +862,8 @@ _key_syms = set(live_state["positions"]) | set(_live_top10)
 signal_incomplete = bool(order_plan and signal_missing
                          and (len(signal_missing) > QUOTE_GAP_TOLERANCE or _key_syms & set(signal_missing)))
 
-# Ranking shown on the dashboard: the entry-day live ranking during the order plan, else latest close
-cur_sc = live_sc if order_plan else compute_scores(AS_OF)
+# Ranking shown on the dashboard: the live ranking during market hours, else the latest close
+cur_sc = live_sc if LIVE_VIEW else compute_scores(AS_OF)
 cur_ranked = sorted(cur_sc, key=lambda k: cur_sc[k]["score"], reverse=True)
 cur_rank = {s: i for i, s in enumerate(cur_ranked, 1)}
 cur_top = set(cur_ranked[:N_HOLD])
@@ -854,7 +873,7 @@ live_cash = float(live_daily["cash"].iloc[-1]) if live_started else float(INITIA
 # Current live positions
 pos_rows = []
 for sym, p in live_state["positions"].items():
-    price = px(sym, AS_OF)
+    price = cur_px(sym)
     peak = max(p["peak"], price)
     hard = p["entry_price"] * (1 - SL_PCT)
     trail = peak * (1 - TRAIL_PCT)
@@ -908,7 +927,7 @@ if executed_today:
 else:
     act_mode = "incomplete" if signal_incomplete else "orderplan" if order_plan else "preview"
     _pv = copy.deepcopy(live_state)
-    rebalance(_pv, AS_OF, AS_OF, verbose=False, preview=True, live=live_quotes if order_plan else None)
+    rebalance(_pv, AS_OF, AS_OF, verbose=False, preview=True, live=live_quotes if LIVE_VIEW else None)
     act_log = [a for a in _pv["log"] if a["date"] == AS_OF.date() and a["signal_date"] == AS_OF.date()]
 acts = {k: [a for a in act_log if a["action"] == k] for k in ("BUY", "HOLD", "SELL", "SKIP")}
 _rec_now = ENTRIES.get(AS_OF.strftime("%Y-%m")) if executed_today else None
@@ -1022,10 +1041,11 @@ for sym in cur_ranked:
         above_dma=above, held=held, signal=sig,
         target=target_now if sig in ("HOLD", "NEW ENTRY") else None,
         est_qty=math.floor(target_now / i["price"]) if sig == "NEW ENTRY" else None,
-        price_date=last_px_date[sym].date(), behind=sessions_behind[sym]))
+        price_date=cur_px_label(sym),
+        behind=0 if (LIVE_VIEW and sym in live_quotes) else sessions_behind[sym]))
 for r in pos_rows:
-    r["price_date"] = last_px_date[r["symbol"]].date()
-    r["behind"] = sessions_behind[r["symbol"]]
+    r["price_date"] = cur_px_label(r["symbol"])
+    r["behind"] = 0 if (LIVE_VIEW and r["symbol"] in live_quotes) else sessions_behind[r["symbol"]]
 
 # Live performance (only from LIVE_START_DATE)
 live_trades_df = pd.DataFrame(live_state["trades"])
@@ -1355,7 +1375,7 @@ def build_account(trades, cash_moves, issues):
     holdings = []
     for sym in sorted(set(held) | set(strat_pos), key=lambda s: (cur_rank.get(s, 999), s)):
         h = held.get(sym, {"qty": 0, "cost": 0.0})
-        price = px(sym, AS_OF) if sym in SYMBOLS else None
+        price = cur_px(sym) if sym in SYMBOLS else None
         value = h["qty"] * price if price is not None else None
         avg = h["cost"] / h["qty"] if h["qty"] else None
         sq = strat_pos[sym]["qty"] if sym in strat_pos else 0
@@ -1481,6 +1501,20 @@ if account_error is None:
     account_cash, _cash_issues = parse_cash(_c_rows)
     account_issues += _cash_issues
     account = build_account(account_trades, account_cash, account_issues)
+    # Live performance since the start (market hours): the closing-price index extended by today's
+    # live values — the same numbers as the ★ live point on the chart. Never stored in the history.
+    account["perf_live"] = None
+    if LIVE_VIEW and account["daily"] and account["perf"]:
+        _ld = account["daily"][-1]
+        _ai = _ld["idx"] * (account["value"] / _ld["value"]) if _ld["value"] else None
+        _ni = (_ld["nifty_idx"] * bm_live / float(bm_raw.iloc[-1])
+               if bm_live and _ld["nifty_idx"] is not None and not bm_raw.empty else None)
+        _si = live_value / INITIAL_CAPITAL * 100 if live_started else None
+        account["perf_live"] = dict(start=account["perf"]["start"], time=live_quote_time,
+                                    account_idx=_ai, strategy_idx=_si, nifty_idx=_ni,
+                                    account_pct=_ai - 100 if _ai is not None else None,
+                                    strategy_pct=_si - 100 if _si is not None else None,
+                                    nifty_pct=_ni - 100 if _ni is not None else None)
     print(f"  [MY ACCOUNT] Google Sheet: {len(account_trades)} trade row(s), {len(account_cash)} cash row(s), "
           f"{len(account_issues)} problem row(s)"
           + ("" if IN_CI else f" · value ₹{account['value']:,.0f} ({account['ret_pct']:+.2f}%)"))
@@ -1835,8 +1869,12 @@ def badge(text):
 
 
 def pxdate(v):
-    """Last actual price date; ⚠ when older than the latest market date (price carried forward)."""
-    return f"⚠ {v} ({sessions_behind_by_date(v)} behind)" if v < AS_OF.date() else f"✓ {v}"
+    """Price source: 🟢 live quote, ✓ latest close, or ⚠ an older close (price carried forward)."""
+    if isinstance(v, str):
+        return f"🟢 {v}"
+    if v < AS_OF.date():
+        return f"⚠ {v} ({sessions_behind_by_date(v)} behind)"
+    return f"✓ {v}" + (" (no live quote)" if LIVE_VIEW else "")
 
 
 def sessions_behind_by_date(v):
@@ -1896,18 +1934,18 @@ else:
         kpi("Cash", inr(_a["cash"])),
         kpi("XIRR (annualised)", pct(_a["xirr"]) if _a["xirr"] is not None else
             (f"after {XIRR_MIN_DAYS} days" if _a["xirr_days"] is not None else "—"), pn(_a["xirr"])),
-        kpi("vs Nifty 500" + (f" since {_a['perf']['start']}" if _a["perf"] else ""),
-            f"{_a['perf']['account_pct'] - _a['perf']['nifty_pct']:+.2f} pp"
-            if _a["perf"] and _a["perf"]["nifty_pct"] is not None else "—",
-            pn(_a["perf"]["account_pct"] - _a["perf"]["nifty_pct"])
-            if _a["perf"] and _a["perf"]["nifty_pct"] is not None else ""),
+        kpi("vs Nifty 500" + (f" since {_pf['start']}" if (_pf := _a.get("perf_live") or _a["perf"]) else ""),
+            f"{_pf['account_pct'] - _pf['nifty_pct']:+.2f} pp"
+            if _pf and _pf["account_pct"] is not None and _pf["nifty_pct"] is not None else "—",
+            pn(_pf["account_pct"] - _pf["nifty_pct"])
+            if _pf and _pf["account_pct"] is not None and _pf["nifty_pct"] is not None else ""),
         kpi("Execution vs close", (("saved " if _a["exec_total"] < 0 else "cost ") + inr(abs(_a["exec_total"])))
             if _a["exec_total"] is not None else "—", pn(-_a["exec_total"]) if _a["exec_total"] is not None else ""),
     ])
     _hold_cols = [
         ("symbol", "Symbol", None), ("category", "Category", None), ("qty", "My Qty", str),
         ("avg_cost", "Avg Cost (incl. charges)", num), ("invested", "Invested", inr),
-        ("price", f"Price ({AS_OF.date()})", num), ("value", "Value", inr), ("upnl", "Unrealised P&L ₹", inr),
+        ("price", f"Price ({'live ' + live_quote_time if LIVE_VIEW else AS_OF.date()})", num), ("value", "Value", inr), ("upnl", "Unrealised P&L ₹", inr),
         ("upnl_pct", "Unrealised P&L %", pct), ("strategy_qty", "Strategy Qty", str),
         ("qty_diff", "Diff", lambda v: f"{v:+d}" if v else "0"), ("status", "Status", None),
     ]
@@ -1933,7 +1971,7 @@ else:
                        f"⚠ {_a['latest_mismatches']} difference(s) from the strategy plan."))
     account_html = f"""
 <p class='muted'>From your Google Sheet: {len(account_trades)} trade row(s), {len(account_cash)} cash row(s), read
-{now_ist():%Y-%m-%d %H:%M} IST. Prices = {AS_OF.date()} close; P&L after charges (average-cost method).{_cap_note}{_latest_note}</p>
+{now_ist():%Y-%m-%d %H:%M} IST. Prices = {f"live {live_quote_time} IST" if LIVE_VIEW else f"{AS_OF.date()} close"}; P&L after charges (average-cost method).{_cap_note}{_latest_note}</p>
 {_issues_html}
 <div class="kpis">{_acct_kpis}</div>
 <h3>My holdings vs strategy</h3>
@@ -1954,13 +1992,23 @@ if account is not None:
         if _a["daily"][0]["nifty_idx"] is not None:
             f_acct.add_trace(go.Scatter(x=_dd, y=[r["nifty_idx"] for r in _a["daily"]], name="Nifty 500",
                                         mode="lines+markers", line=dict(color=GRAY, dash="dash")))
+        _pl = _a.get("perf_live")
+        if _pl:                                    # separate, clearly marked live point (not history)
+            _lx = [pd.Timestamp(now_ist())]
+            for _y, _n, _c in ((_pl["account_idx"], "My account (live)", GRN),
+                               (_pl["strategy_idx"], "Strategy (live)", AMBER),
+                               (_pl["nifty_idx"], "Nifty 500 (live)", GRAY)):
+                if _y is not None:
+                    f_acct.add_trace(go.Scatter(x=_lx, y=[_y], name=f"{_n} {live_quote_time}", mode="markers",
+                                                marker=dict(color=_c, size=13, symbol="star",
+                                                            line=dict(color="#fff", width=1))))
         f_acct.add_hline(y=100, line=dict(color=MUTED, dash="dot", width=1))
         style(f_acct, f"Growth of 100 since {_a['perf']['start']} — my account (time-weighted) vs strategy vs Nifty 500", 380)
         f_acct.update_layout(yaxis_title="Index (start = 100)", xaxis_title="Date")
-        _perf = _a["perf"]
+        _perf = _a.get("perf_live") or _a["perf"]
         account_html += f"""
 <h3>My account vs strategy vs Nifty 500</h3>
-<p class='muted'>Since {_perf['start']}: my account {pct(_perf['account_pct'])} · strategy record {pct(_perf['strategy_pct'])}
+<p class='muted'>Since {_perf['start']}{" (live " + _perf["time"] + " IST)" if _a.get("perf_live") else ""}: my account {pct(_perf['account_pct'])} · strategy record {pct(_perf['strategy_pct'])}
 · Nifty 500 {pct(_perf['nifty_pct'])}. Account return is time-weighted, so deposits and withdrawals do not count as
 performance. XIRR (money-weighted, annualised) is shown once {XIRR_MIN_DAYS}+ days have passed.
 {"⚠ No price for: " + ", ".join(_a["unpriced"]) + " — valued at 0 in this chart." if _a["unpriced"] else ""}</p>
@@ -2035,9 +2083,10 @@ out_html = act_lines([dict(symbol=s, rank=cur_rank[s], score=cur_sc[s]["score"],
                                f"{'above' if a['above'] else 'below'} DMA</span>")
 _exp = lambda known: "" if known else " (expected)"
 market_html = ("" if not MARKET_HOURS else
-               f"<div class='marketopen'>🕒 <b>Market open</b> — today's ({TODAY.date()}) prices are live quotes, "
-               f"not closing prices, so they are not used in the portfolio history. Values below are as of the "
-               f"{AS_OF.date()} close" + (" (the order plan uses live prices)." if order_plan else ".") + "</div>")
+               f"<div class='marketopen'>🟢 <b>Market open — live prices {live_quote_time} IST</b>. Current values "
+               f"(positions, P&amp;L, stops, signals, ranking, My Account) use today's live Yahoo prices; ETFs "
+               f"without a live quote use the {AS_OF.date()} close. Live prices are never recorded as closes: "
+               f"history charts use closing prices plus a ★ live point.</div>")
 if act_mode == "orderplan":
     act_banner = (f"🛒 ORDER PLAN — entry day {TODAY.date()} · signal and quantities from live prices at "
                   f"{live_quote_time} IST · NOT recorded yet")
@@ -2060,9 +2109,10 @@ elif act_mode == "executed":
                    f"Decision: {signal_source}.")
     act_prefix = "EXECUTED"
 else:
-    act_banner = (f"PREVIEW — from the latest close ({AS_OF.date()}); final decision on the entry day "
+    _basis = f"live prices {live_quote_time} IST" if LIVE_VIEW else f"the latest close ({AS_OF.date()})"
+    act_banner = (f"PREVIEW — from {_basis}; final decision on the entry day "
                   f"{next_rebal.date()}{_exp(next_confirmed)}")
-    act_caption = (f"Uses the latest close ({AS_OF.date()}), which is not the final decision. On the entry day "
+    act_caption = (f"Uses {_basis}, which is not the final decision. On the entry day "
                    f"{next_rebal.date()}{_exp(next_confirmed)} run the workflow during market hours (~14:00 IST) "
                    f"for the order plan from live prices. Prices are estimates.")
     if signal_status == "ENTRY DAY":
@@ -2249,6 +2299,10 @@ if live_started:
                                line=dict(color=BLUE, width=1.5)))
     f_val.add_trace(go.Scatter(x=live_daily.index, y=live_daily["cash"], name="Cash",
                                line=dict(color=GRAY, width=1, dash="dot")))
+    if LIVE_VIEW:                                  # separate, clearly marked live point (not history)
+        f_val.add_trace(go.Scatter(x=[pd.Timestamp(now_ist())], y=[live_value],
+                                   name=f"Live {live_quote_time} IST", mode="markers",
+                                   marker=dict(color=AMBER, size=14, symbol="star", line=dict(color="#fff", width=1))))
     f_val.add_hline(y=INITIAL_CAPITAL, line=dict(color=MUTED, dash="dash", width=1),
                     annotation_text=f"Initial {inr(INITIAL_CAPITAL)}", annotation_font_color=MUTED)
     style(f_val, "Live Portfolio Value", 430)
@@ -2561,6 +2615,7 @@ summary = {
     "act_mode": act_mode,                         # preview / orderplan / incomplete / executed
     "market_hours": MARKET_HOURS,
     "live_quote_time": live_quote_time,
+    "live_view": LIVE_VIEW,
     "order_plan_missing_quotes": order_plan_missing_quotes,
     "signal_source": signal_source,               # live / decision source of a recorded entry / latest close
     "signal_missing": signal_missing,             # ETFs without a live price (order plan)
@@ -2588,7 +2643,7 @@ summary = {
         "latest_mismatches": account["latest_mismatches"],
         "latest_pva": [r for r in account["pva"] if r["month"] == account["latest_month"]],
         "xirr": account["xirr"], "xirr_days": account["xirr_days"], "xirr_min_days": XIRR_MIN_DAYS,
-        "perf": account["perf"], "exec_total": account["exec_total"],
+        "perf": account["perf"], "perf_live": account["perf_live"], "exec_total": account["exec_total"],
         "exec_latest": account["exec_months"][-1] if account["exec_months"] else None,
         "holdings": [{k: h[k] for k in ("symbol", "qty", "avg_cost", "value", "upnl", "upnl_pct",
                                          "strategy_qty", "status")} for h in account["holdings"]],
