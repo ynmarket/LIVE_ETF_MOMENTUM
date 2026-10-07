@@ -119,8 +119,8 @@ Categories are display labels only (MONQ50 = International, it is the Motilal Os
 ### Local only (NOT in git)
 | Path | Role |
 |---|---|
-| `local_config.json` | `{"gsheet_id": ..., "service_account_file": "F:\\1.AI_Market\\keys\\etf-momentum-<id>.json"}` — lets local runs read the Google Sheet. **Never commit.** |
-| `F:\1.AI_Market\keys\etf-momentum-*.json` | Google service-account key (a password). Outside the repo. Never print/commit. |
+| `local_config.json` | `{"gsheet_id": "..."}` (optionally `"service_account_file"`, absolute or relative to the project) — lets local runs read the Google Sheet. Per machine, **never commit** (git-ignored). |
+| `keys/*.json` or `../keys/*.json` | Google service-account key (a password). Found automatically in `<project>/keys/` (git-ignored) or a `keys/` folder next to the project (this laptop: `F:\1.AI_Market\keys\`). Never print/commit. |
 | `reports/` | Local outputs: `ETF_Momentum_Test_1_Report.html` (full), `..._Report_public.html` (no My Account), `ETF_Momentum_Test_1_Report.xlsx`, `summary.json`, `summary_public.json` |
 | `ETF_Momentum_Output/` | Old output folder from before the move to `reports/` (ignored; can be deleted by the user) |
 
@@ -201,9 +201,14 @@ Exit codes: 2 data, 3 Excel, 4 HTML, 5 summary (mapped to messages by the workfl
 * The user's real fills and account figures are **private**: read them from the Google Sheet (local run
   with `local_config.json`), the local report/Excel, or the password-protected page — never write them
   into tracked files (this repository is public).
-* Reading: Sheets API v4 `values:batchGet`, `UNFORMATTED_VALUE` + serial dates. Credentials: env
-  `GSHEET_ID` + `GOOGLE_SERVICE_ACCOUNT_JSON` (CI) or `local_config.json` (local). A read failure never
-  stops the run.
+* Reading: Sheets API v4 `values:batchGet`, `UNFORMATTED_VALUE` + serial dates. A read failure never
+  stops the run. Credentials (`_account_credentials` / `_find_key_file`, no machine-specific paths):
+  Sheet ID = env `GSHEET_ID` or `local_config.json` `gsheet_id`; key = env `GOOGLE_SERVICE_ACCOUNT_JSON`
+  (CI) → env `GOOGLE_SERVICE_ACCOUNT_FILE` / `GOOGLE_APPLICATION_CREDENTIALS` → `local_config.json`
+  `service_account_file` (absolute or project-relative; skipped with a warning if missing) → first
+  service-account `*.json` in `<project>/keys/` or `<project>/../keys/`.
+* **New laptop setup**: clone the repo, copy the key `.json` into `<repo>/keys/`, create
+  `local_config.json` with `{"gsheet_id": "<ask the user>"}`, `pip install -r requirements.txt`, run.
 * Validation: bad rows (unknown symbol, bad side, non-positive qty/price, bad date, selling more than held)
   are listed and **not used**.
 * Calculations: average-cost holdings incl. charges; realised/unrealised P&L after charges; cash; account

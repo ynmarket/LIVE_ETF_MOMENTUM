@@ -1133,8 +1133,11 @@ for _sym in cur_ranked:
 # The user records every real fill in the Google Sheet "Trades" tab (and optionally deposits etc. in
 # "Cash"). A Google service account with VIEWER access reads it. Credentials:
 #   GitHub Actions: secrets GSHEET_ID + GOOGLE_SERVICE_ACCOUNT_JSON (passed as environment variables)
-#   Local runs:     local_config.json (git-ignored) {"gsheet_id": ..., "service_account_file": ...}
+#   Local runs:     local_config.json (git-ignored) {"gsheet_id": ...} — the key file is found without
+#                   any machine-specific path (see _find_key_file), so the project works from any
+#                   drive / folder / laptop.
 LOCAL_CONFIG_PATH = BASE_DIR / "local_config.json"
+KEY_DIRS = [BASE_DIR / "keys", BASE_DIR.parent / "keys"]   # <project>/keys (git-ignored) or a sibling keys/
 XIRR_MIN_DAYS = 30                                # annualising a few days' return is meaningless
 SHEET_EPOCH = datetime(1899, 12, 30)              # Google Sheets serial-date day 0
 TRADE_COLS = {"date": "Trade Date", "symbol": "Symbol", "side": "Side", "qty": "Quantity",
@@ -1144,8 +1147,49 @@ CASH_COLS = {"date": "Date", "type": "Type", "amount": "Amount ₹", "notes": "N
 UNIVERSE_SYMBOLS = {s for s, _ in UNIVERSE}
 
 
+def _load_key(path):
+    """Service-account key dict from a JSON file, or None if it is missing / not a service-account key."""
+    try:
+        info = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return info if isinstance(info, dict) and info.get("type") == "service_account" else None
+
+
+def _find_key_file(cfg):
+    """Locate the service-account key, independent of drive / folder / laptop. First match wins:
+      1. env GOOGLE_SERVICE_ACCOUNT_FILE or GOOGLE_APPLICATION_CREDENTIALS (a file path)
+      2. local_config.json "service_account_file" — absolute, or relative to the project folder
+         (a path that does not exist on this machine is skipped with a warning, not an error)
+      3. any service-account key *.json in <project>/keys/ or in a keys/ folder next to the project
+    Returns (info, source, places_tried)."""
+    tried = []
+    for env in ("GOOGLE_SERVICE_ACCOUNT_FILE", "GOOGLE_APPLICATION_CREDENTIALS"):
+        if os.environ.get(env):
+            tried.append(f"${env}")
+            info = _load_key(os.environ[env])
+            if info:
+                return info, f"${env}", tried
+    if cfg.get("service_account_file"):
+        p = Path(cfg["service_account_file"])
+        p = p if p.is_absolute() else BASE_DIR / p
+        tried.append(f"local_config.json → {p}")
+        info = _load_key(p)
+        if info:
+            return info, str(p), tried
+        print(f"  [warn] key file from local_config.json not found on this machine: {p} — searching keys/ folders")
+    for d in KEY_DIRS:
+        tried.append(f"{d}{os.sep}*.json")
+        for f in sorted(d.glob("*.json")) if d.is_dir() else []:
+            info = _load_key(f)
+            if info:
+                return info, str(f), tried
+    return None, None, tried
+
+
 def _account_credentials():
-    """(sheet_id, service-account info dict) or (None, None) when not configured."""
+    """(sheet_id, service-account info dict, problem). problem is None when both are found,
+    "not configured" when nothing is set up, else a message explaining what is missing."""
     cfg = {}
     try:
         cfg = json.loads(LOCAL_CONFIG_PATH.read_text(encoding="utf-8"))
@@ -1154,21 +1198,29 @@ def _account_credentials():
     except ValueError as e:
         print(f"  [warn] {LOCAL_CONFIG_PATH.name} is not valid JSON ({e})")
     sheet_id = (os.environ.get("GSHEET_ID") or cfg.get("gsheet_id") or "").strip() or None
-    info = None
-    if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
-        info = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-    elif cfg.get("service_account_file"):
-        info = json.loads(Path(cfg["service_account_file"]).read_text(encoding="utf-8"))
-    return sheet_id, info
+    if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):                 # GitHub Actions secret
+        info, tried = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]), []
+    else:
+        info, _src, tried = _find_key_file(cfg)
+    if not sheet_id and not info:
+        return None, None, "not configured"
+    if not sheet_id:
+        return None, None, (f"Google Sheet ID missing — add \"gsheet_id\" to {LOCAL_CONFIG_PATH.name} "
+                            f"(or set GSHEET_ID)")
+    if not info:
+        return None, None, ("service-account key not found. Put the key .json in "
+                            f"{BASE_DIR / 'keys'} (git-ignored) or a keys folder next to the project, or "
+                            f"set GOOGLE_SERVICE_ACCOUNT_FILE. Looked in: " + "; ".join(tried))
+    return sheet_id, info, None
 
 
 def read_trade_sheet():
     """Read the Trades and Cash tabs. Returns (trade_rows, cash_rows, error) — rows are lists of dicts
     keyed by column header; error is None on success, a message otherwise. Never raises."""
     try:
-        sheet_id, info = _account_credentials()
-        if not sheet_id or not info:
-            return None, None, "not configured"
+        sheet_id, info, problem = _account_credentials()
+        if problem:
+            return None, None, problem
         import requests
         from google.oauth2 import service_account
         from google.auth.transport.requests import Request
