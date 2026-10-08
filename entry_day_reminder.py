@@ -67,6 +67,8 @@ def reminder_text(day, test=False):
         "",
         "Run the workflow now for the 🛒 order plan (signal and quantities from live prices):",
         "GitHub → Actions → <b>Run ETF Strategy</b> → <b>Run workflow</b> (keep Telegram ticked).",
+        "If you don't, the automatic ~14:30 run sends the order plan; it never replaces a choice "
+        "already saved by your own run today.",
         "",
         "After placing the orders, add your fills (price, quantity, charges) to the Google Sheet.",
         f'🔗 <a href="{actions}">Open the workflow</a> · <a href="{page}">Open report</a>',

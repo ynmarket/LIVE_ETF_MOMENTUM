@@ -8,7 +8,8 @@ Reads reports/summary.json (written by ETF_Momentum_Test_1.py) and sends:
   ⚠️ exit risk                               (stop hit, near a stop, or outside the top 6)
   👤 your account (reference)                (stop levels from your own fills hit / near — info only)
   ⚠️ data delayed                            (held / top-6 / action ETFs without the latest price)
-  📊 daily summary                           (evening and manual runs)
+  📊 daily summary / 🕑 midday update         (evening, ~14:30 midday and manual runs; per-position
+                                             strategy SL levels + your holdings with reference SL levels)
   ❌ run failed                              (--failure)
 
 Alert messages are de-duplicated against the previously published summary, so the
@@ -96,8 +97,9 @@ def footer():
 
 
 # ── message builders ─────────────────────────────────────────────────────────
-def msg_summary(s, prev):
-    lines = [f"📊 <b>ETF Momentum — Daily Summary</b>",
+def msg_summary(s, prev, mode="manual"):
+    title = "🕑 <b>ETF Momentum — Midday Update</b>" if mode == "midday" else "📊 <b>ETF Momentum — Daily Summary</b>"
+    lines = [title,
              (f"🟢 Live prices {esc(s['live_quote_time'])} IST (market open) · last close {d(s['as_of'])}"
               if s.get("live_view") else f"Data as of {d(s['as_of'])}") + f" · generated {esc(s['generated_ist'])} IST", ""]
     if s["live_started"]:
@@ -107,7 +109,9 @@ def msg_summary(s, prev):
                   "", f"<b>Positions ({s['n_positions']}/{s['n_hold']})</b>"]
         for p in s["positions"]:
             flag = "" if p["status"] == "HOLD" else f"  ⚠️ {esc(p['status'].replace('EXIT RISK — ', ''))}"
-            lines.append(f"• {esc(p['symbol'])}  {pct(p['pnl_pct'])}  {inr(p['value'])}{flag}")
+            lines.append(f"• <b>{esc(p['symbol'])}</b> {num(p['price'])} · {pct(p['pnl_pct'])} · {inr(p['value'])}{flag}")
+            lines.append(f"   Hard SL {num(p['hard_sl'])} ({pct(p['dist_sl'], False)}) · "
+                         f"Trail {num(p['trail_sl'])} ({pct(p['dist_trail'], False)})")
     else:
         buys = ", ".join(esc(a["symbol"]) for a in s["actions"]["BUY"]) or "none"
         basis = ("order plan, live prices" if s.get("act_mode") in ("orderplan", "incomplete")
@@ -146,6 +150,16 @@ def account_lines(s):
         live_tag = f" (live {esc(perf['time'])})" if a.get("perf_live") else ""
         out.append(f"📈 Since {perf['start']}{live_tag}: account {pct(perf['account_pct'])} · strategy "
                    f"{pct(perf['strategy_pct'])} · Nifty 500 {pct(perf['nifty_pct'])}")
+    held = [h for h in a.get("holdings", []) if h.get("qty") and h.get("avg_fill") is not None]
+    if held:
+        out.append("<b>My holdings</b> (my SL levels = reference only; exits follow the strategy)")
+    for h in held:
+        flag = "" if h["my_stop_status"] == "OK" else f"  ⚠️ {esc(h['my_stop_status'])}"
+        stale = " · price stale" if h.get("my_price_stale") else ""
+        out.append(f"• <b>{esc(h['symbol'])}</b> {h['qty']} @ {num(h['avg_fill'])} → {num(h['price'])} · "
+                   f"{pct(h['upnl_pct'])}{flag}{stale}")
+        out.append(f"   My Hard SL {num(h['my_hard_sl'])} ({pct(h['my_dist_sl'], False)}) · "
+                   f"My Trail {num(h['my_trail_sl'])} ({pct(h['my_dist_trail'], False)})")
     if a.get("xirr") is not None:
         out.append(f"XIRR (annualised): {pct(a['xirr'])}")
     if a.get("exec_total") is not None:
@@ -169,6 +183,9 @@ def msg_order_plan(s):
     lines = [f"🛒 <b>ORDER PLAN — {month} entry day, execute TODAY before close</b>",
              f"{d(s['next_exec_date'])} · signal and quantities from live prices at "
              f"{esc(s['live_quote_time'])} IST · <b>not recorded yet</b>", ""]
+    if s.get("kept_decision"):
+        lines[1:2] = [f"{d(s['next_exec_date'])} · ETF choice kept from your earlier run: "
+                      f"{esc(s['kept_decision'])} · quantities from live prices at {esc(s['live_quote_time'])} IST"]
     if a["BUY"]:
         lines.append("🟢 <b>BUY</b>")
         lines += [f"• {esc(x['symbol'])} — <b>{x['qty']}</b> units × {num(x['price'])} = {inr(x['value'])} "
@@ -339,8 +356,8 @@ def build_messages(s, prev, mode):
         msgs.append(msg_my_stops(s))
     if data_affected(s) and new(key_data):
         msgs.append(msg_data(s))
-    if mode in ("evening", "manual"):
-        msgs.append(msg_summary(s, prev))
+    if mode in ("evening", "manual", "midday"):
+        msgs.append(msg_summary(s, prev, mode))
     return msgs
 
 
@@ -379,7 +396,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--summary", default="reports/summary.json")
     ap.add_argument("--previous", default=None, help="previous published summary.json (for de-duplication)")
-    ap.add_argument("--mode", choices=["evening", "morning", "manual"], default="manual")
+    ap.add_argument("--mode", choices=["evening", "midday", "morning", "manual"], default="manual")
     ap.add_argument("--failure", metavar="PROBLEM", help="send a failure alert instead of the report messages")
     ap.add_argument("--dry-run", action="store_true", help="print messages instead of sending them")
     args = ap.parse_args()

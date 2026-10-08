@@ -919,6 +919,15 @@ elif entry_today:
 else:
     signal_status = "PENDING"
 
+# Scheduled midday run (GitHub, ~14:30 IST): an entry-day choice already saved TODAY (e.g. by the
+# user's own order-plan run) is kept, never replaced — the order plan then shows that saved choice
+# with quantities from live prices. Manual runs behave as before (the last one of the day wins).
+MIDDAY_RUN = os.environ.get("RUN_KIND") == "midday"
+_saved_today = ENTRIES.get(next_month) if order_plan else None
+kept_decision = bool(MIDDAY_RUN and _saved_today and _saved_today.get("entry_date") == str(TODAY.date()))
+kept_decision_info = (f"{_saved_today['decided_from']} (saved {_saved_today.get('saved', {}).get('at_ist', '?')} IST)"
+                      if kept_decision else None)
+
 # Actions: the recorded entry-day rebalance (today's close), or the SAME engine run on a copy —
 # with today's live prices during the entry-day order plan, otherwise a preview from the latest close.
 if executed_today:
@@ -927,7 +936,8 @@ if executed_today:
 else:
     act_mode = "incomplete" if signal_incomplete else "orderplan" if order_plan else "preview"
     _pv = copy.deepcopy(live_state)
-    rebalance(_pv, AS_OF, AS_OF, verbose=False, preview=True, live=live_quotes if LIVE_VIEW else None)
+    rebalance(_pv, AS_OF, AS_OF, verbose=False, preview=True, live=live_quotes if LIVE_VIEW else None,
+              decisions=entry_decisions(_saved_today) if kept_decision else None)
     act_log = [a for a in _pv["log"] if a["date"] == AS_OF.date() and a["signal_date"] == AS_OF.date()]
 acts = {k: [a for a in act_log if a["action"] == k] for k in ("BUY", "HOLD", "SELL", "SKIP")}
 _rec_now = ENTRIES.get(AS_OF.strftime("%Y-%m")) if executed_today else None
@@ -963,8 +973,12 @@ def _decisions_from_log(entries, top6, score_map):
 entry_notes = []
 _entries_new = copy.deepcopy(ENTRIES)
 _stamp = {"at_ist": now_ist().strftime("%Y-%m-%d %H:%M"), "run_id": os.environ.get("GITHUB_RUN_ID")}
-# 1) Entry-day run during market hours: save the ETFs chosen now (the last such run of the day wins)
-if order_plan and not signal_incomplete:
+# 1) Entry-day run during market hours: save the ETFs chosen now (the last such run of the day wins;
+#    the scheduled midday run never replaces a choice already saved today)
+if kept_decision:
+    print(f"  [KEPT] {next_month} entry-day choice already saved today — {kept_decision_info}; "
+          f"scheduled midday run does not replace it")
+elif order_plan and not signal_incomplete:
     _entries_new[next_month] = {
         "entry_date": str(TODAY.date()),
         "decided_from": f"entry-day run, live prices {live_quote_time} IST",
@@ -2714,6 +2728,7 @@ summary = {
     "signal_source": signal_source,               # live / decision source of a recorded entry / latest close
     "signal_missing": signal_missing,             # ETFs without a live price (order plan)
     "saved_entries": sorted(_entries_new),
+    "kept_decision": kept_decision_info,          # midday run kept today's saved entry-day choice
     "entry_notes": entry_notes,
     "last_signal_date": cur_signal.date() if cur_signal is not None else None,
     "last_exec_date": cur_rebal.date() if cur_rebal is not None else None,

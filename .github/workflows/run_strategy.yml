@@ -9,9 +9,10 @@ on:
         type: boolean
         default: true
   # Automatic (GitHub cron is UTC; time below is IST). Off the hour to avoid peak delays.
-  # Evening only: a morning run was removed because Yahoo withdraws the previous day's prices
+  # No morning run: it was removed because Yahoo withdraws the previous day's prices
   # overnight for many ETFs, which produced misleading signals.
   schedule:
+    - cron: "55 8 * * 1-5"    # ~14:30 IST Mon–Fri — midday update with live prices (set 14:25; GitHub often starts late)
     - cron: "45 14 * * 1-5"   # 20:15 IST Mon–Fri — evening run after NSE close
 
 # One run at a time: a scheduled and a manual run never overlap (the second one waits)
@@ -54,6 +55,8 @@ jobs:
           # "My Account": read-only access to the Google Sheet of real trades
           GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          # Scheduled midday run: never replaces an entry-day choice already saved that day
+          RUN_KIND: ${{ github.event.schedule == '55 8 * * 1-5' && 'midday' || '' }}
         run: |
           set +e
           python ETF_Momentum_Test_1.py --force
@@ -264,6 +267,7 @@ jobs:
           else
             case "$SCHEDULE" in
               "45 14 * * 1-5") mode=evening ;;
+              "55 8 * * 1-5")  mode=midday ;;
               *)               mode=manual ;;
             esac
             prev=""; [ -f reports/previous_summary.json ] && prev="--previous reports/previous_summary.json"

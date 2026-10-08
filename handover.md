@@ -76,7 +76,13 @@ Monthly user routine:
 2. Same evening **20:15 IST** scheduled run records the trades at the **close** using the saved 2 PM choice.
 3. User types real fills (date, symbol, side, qty, price, charges) into the Google Sheet → next run shows
    **My Account** and plan-vs-actual.
-4. Every weekday 20:15 IST: daily summary on Telegram.
+4. Every weekday **~14:30 IST** (scheduled 14:25, GitHub often starts late): 🕑 **Midday Update** on Telegram
+   with live prices — strategy positions with Hard SL / Trail SL + distances, My Account holdings with the
+   reference levels from the user's fills; alerts (exit risk, 👤 your account, data) only when new.
+   On the entry day this run also sends the 🛒 order plan; it **never replaces an entry-day choice already
+   saved that day** (env `RUN_KIND=midday` → `kept_decision`; the order plan then shows the saved choice
+   with live quantities). If no choice was saved yet, it saves its own (as a manual run would).
+5. Every weekday 20:15 IST: daily summary on Telegram (same per-position SL detail, closing prices).
 
 ---
 
@@ -106,7 +112,7 @@ Categories are display labels only (MONQ50 = International, it is the Motilal Os
 | File | Lines | Role |
 |---|---|---|
 | `ETF_Momentum_Test_1.py` | ~2400 | **Everything**: download, cleaning, backtest, live engine, dashboard state, My Account, Excel, HTML, summary.json. Run: `python ETF_Momentum_Test_1.py [--force]` |
-| `notify_telegram.py` | ~330 | Builds/sends Telegram messages from `reports/summary.json` (stdlib only). `--mode evening|manual`, `--previous` for de-duplication, `--failure "<problem>"`, `--dry-run` |
+| `notify_telegram.py` | ~330 | Builds/sends Telegram messages from `reports/summary.json` (stdlib only). `--mode evening|midday|manual`, `--previous` for de-duplication, `--failure "<problem>"`, `--dry-run` |
 | `entry_day_reminder.py` | ~100 | Detects entry day from NIFTYBEES daily bars **with volume > 0**; sends reminder. `--today YYYY-MM-DD`, `--force`, `--dry-run` |
 | `page_crypto.py` | ~125 | AES-256-GCM + PBKDF2-SHA256 (600k) encryption. `page <html> <out>` builds the unlock page; `enc`/`dec` for JSON. Password from `CRYPTO_PASSWORD` or `PAGE_PASSWORD` env |
 | `.github/workflows/run_strategy.yml` | ~260 | Main workflow "Run ETF Strategy" (§9) |
@@ -252,7 +258,8 @@ Exit codes: 2 data, 3 Excel, 4 HTML, 5 summary (mapped to messages by the workfl
   `GSHEET_ID`, `GOOGLE_SERVICE_ACCOUNT_JSON`, `PAGE_PASSWORD`. Never ask for their values.
 * **Workflow "Run ETF Strategy"** (`run_strategy.yml`):
   * Triggers: manual (`workflow_dispatch`, input `telegram` default true) + **schedule
-    `45 14 * * 1-5` = 20:15 IST Mon–Fri** (user wants this kept). Concurrency group `run-etf-strategy`.
+    `45 14 * * 1-5` = 20:15 IST Mon–Fri** (user wants this kept) + **`55 8 * * 1-5` = ~14:30 IST Mon–Fri
+    midday update** (added 2026-10-08 at the user's request; sets `RUN_KIND=midday`, Telegram `--mode midday`). Concurrency group `run-etf-strategy`.
   * Job `run-strategy` (contents: write): checkout → Python 3.14 → `pip install -r requirements.txt` →
     run script `--force` (exit-code → error titles) → **Verify reports** (incl. **privacy check**: public
     page/summary must not contain My Account) → **Save entry-day decision** (commits `live_state/`) →
@@ -365,6 +372,8 @@ Exit codes: 2 data, 3 Excel, 4 HTML, 5 summary (mapped to messages by the workfl
 13. Live view: live prices for all current values during market hours (★ live points on charts).
 14. Reference stop levels from the user's own fills in My Account + 👤 Telegram alert (info only; §8);
     strategy trailing-stop display now shows the stored engine peak (no today's price).
+15. ~14:30 IST midday scheduled update (live prices, full SL detail; keeps a choice saved earlier that
+    day); per-position SL lines in all summaries; reminder mentions the 14:30 fallback.
 
 ## 14. What was tried and did NOT work / was reverted (don't repeat)
 

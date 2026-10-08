@@ -16,7 +16,7 @@ A monthly **ETF momentum rotation strategy on NSE** traded with **real money** (
 2026-10-01). `ETF_Momentum_Test_1.py` downloads Yahoo Finance data for a fixed 54-ETF universe, runs a
 historical backtest (reference) and a live strategy record, gives an **entry-day order plan from live
 prices**, compares the user's **real trades from a private Google Sheet** ("My Account"), and writes an
-HTML dashboard, Excel and `summary.json`. GitHub Actions ("Run ETF Strategy", 20:15 IST Mon–Fri +
+HTML dashboard, Excel and `summary.json`. GitHub Actions ("Run ETF Strategy", 20:15 IST and ~14:30 IST midday Mon–Fri +
 manual) publishes a **password-protected** dashboard on GitHub Pages and sends Telegram alerts; a
 separate "Entry Day Reminder" workflow pings the user at 14:00 IST on the first trading day of the month.
 Repo: https://github.com/ynmarket/LIVE_ETF_MOMENTUM · Page: https://ynmarket.github.io/LIVE_ETF_MOMENTUM/
@@ -45,7 +45,8 @@ Repo: https://github.com/ynmarket/LIVE_ETF_MOMENTUM · Page: https://ynmarket.gi
 6. **Keep the user's real account data private.** It must never appear unencrypted on GitHub: not in
    tracked files (incl. `CLAUDE.md`, `handover.md`), not in workflow artifacts, not in Actions logs (CI
    prints only row counts), not on the page without `PAGE_PASSWORD` (public variant has no My Account).
-7. **Keep the 20:15 IST evening schedule** (and its keep-alive). The 08:15 morning run was removed on
+7. **Keep the 20:15 IST evening schedule** (and its keep-alive) and the ~14:30 IST midday update (added at the
+   user's request 2026-10-08; it never replaces an entry-day choice already saved that day). The 08:15 morning run was removed on
    purpose (Yahoo withdraws the previous day's prices overnight) — do not re-add it.
 8. **Universe changes only exactly as instructed** (a swap was once reverted at the user's request).
 9. Investment decisions are the user's; the system only reports what the strategy rules produce.
@@ -90,7 +91,7 @@ generated today.
 | `notify_telegram.py` | Telegram messages from `summary.json` |
 | `entry_day_reminder.py` | 14:00 IST entry-day reminder |
 | `page_crypto.py` | Encrypts the published page/summary (AES-256-GCM, PBKDF2) |
-| `.github/workflows/run_strategy.yml` | Main workflow (20:15 IST + manual) |
+| `.github/workflows/run_strategy.yml` | Main workflow (20:15 IST + ~14:30 IST midday + manual) |
 | `.github/workflows/entry_day_reminder.yml` | Reminder workflow |
 | `live_state/entry_decisions.json` | Saved entry-day ETF choices (written by CI, committed by the workflow) |
 | `handover.md` | Full system documentation — read it first in a new session |
