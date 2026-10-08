@@ -874,7 +874,7 @@ live_cash = float(live_daily["cash"].iloc[-1]) if live_started else float(INITIA
 pos_rows = []
 for sym, p in live_state["positions"].items():
     price = cur_px(sym)
-    peak = max(p["peak"], price)
+    peak = p["peak"]          # stored peak = highest entry-day close since entry: the level the engine checks
     hard = p["entry_price"] * (1 - SL_PCT)
     trail = peak * (1 - TRAIL_PCT)
     d_sl = (price / hard - 1) * 100
@@ -1407,11 +1407,14 @@ def build_account(trades, cash_moves, issues):
     realised = charges = 0.0
     ignored_rows = set()
     for t in trades:
-        h = held.setdefault(t["symbol"], {"qty": 0, "cost": 0.0})
+        h = held.setdefault(t["symbol"], {"qty": 0, "cost": 0.0, "pcost": 0.0, "since": None})
         charges += t["charges"]
         if t["side"] == "BUY":
+            if h["qty"] == 0:
+                h["since"] = t["date"]          # first buy of the current holding
             h["qty"] += t["qty"]
             h["cost"] += t["qty"] * t["price"] + t["charges"]
+            h["pcost"] += t["qty"] * t["price"]  # fill prices only (no charges) — reference stops
         else:
             if t["qty"] > h["qty"]:
                 issues.append({"row": t["row"], "problem": f"SELL {t['qty']} {t['symbol']} is more than the "
@@ -1421,19 +1424,36 @@ def build_account(trades, cash_moves, issues):
                 continue
             avg = h["cost"] / h["qty"]
             realised += t["qty"] * t["price"] - t["charges"] - avg * t["qty"]
+            h["pcost"] -= h["pcost"] / h["qty"] * t["qty"]
             h["cost"] -= avg * t["qty"]
             h["qty"] -= t["qty"]
     strat_pos = live_state["positions"]
+    entry_days = [m["rebal_date"] for m in live["monthly"]] if live_started else []
     holdings = []
     for sym in sorted(set(held) | set(strat_pos), key=lambda s: (cur_rank.get(s, 999), s)):
-        h = held.get(sym, {"qty": 0, "cost": 0.0})
+        h = held.get(sym, {"qty": 0, "cost": 0.0, "pcost": 0.0, "since": None})
         price = cur_px(sym) if sym in SYMBOLS else None
         value = h["qty"] * price if price is not None else None
         avg = h["cost"] / h["qty"] if h["qty"] else None
         sq = strat_pos[sym]["qty"] if sym in strat_pos else 0
         if h["qty"] == 0 and sq == 0:
             continue
-        holdings.append(dict(
+        # Reference stops from YOUR fills (information only — exits follow the strategy levels):
+        # hard SL = avg fill (no charges) × 0.85; peak starts at the avg fill and is raised only by
+        # entry-day closes AFTER the buy date (rule A); trailing SL = peak × 0.80.
+        ref = dict(avg_fill=None, my_hard_sl=None, my_peak=None, my_trail_sl=None,
+                   my_dist_sl=None, my_dist_trail=None, my_stop_status=None, my_price_stale=False)
+        if h["qty"] and price is not None:
+            fill = h["pcost"] / h["qty"]
+            peak = max([fill] + [px(sym, ed) for ed in entry_days if ed.date() > h["since"].date()])
+            hard, trail = fill * (1 - SL_PCT), peak * (1 - TRAIL_PCT)
+            d_sl, d_tr = (price / hard - 1) * 100, (price / trail - 1) * 100
+            ref = dict(avg_fill=fill, my_hard_sl=hard, my_peak=peak, my_trail_sl=trail,
+                       my_dist_sl=d_sl, my_dist_trail=d_tr,
+                       my_stop_status=("Hard SL hit" if price <= hard else "Trail hit" if price <= trail
+                                       else "Near stop" if min(d_sl, d_tr) <= NEAR_STOP_PCT else "OK"),
+                       my_price_stale=not (LIVE_VIEW and sym in live_quotes) and sym in stale)
+        holdings.append(dict(**ref,
             symbol=sym, category=CATEGORY.get(sym, ""), qty=h["qty"], avg_cost=avg, invested=h["cost"],
             price=price, value=value,
             upnl=(value - h["cost"]) if value is not None and h["qty"] else None,
@@ -1741,6 +1761,10 @@ if account is not None:
         "Avg Cost (incl. charges)": h["avg_cost"], "Invested": h["invested"], "Price": h["price"],
         "Value": h["value"], "Unrealised P&L": h["upnl"], "Unrealised P&L %": h["upnl_pct"],
         "Strategy Qty": h["strategy_qty"], "Qty Diff": h["qty_diff"], "Status": h["status"],
+        "Avg Fill (excl. charges)": h["avg_fill"], "My Peak (ref)": h["my_peak"],
+        "My Hard SL (ref)": h["my_hard_sl"], "My Trailing SL (ref)": h["my_trail_sl"],
+        "My Distance to Hard SL %": h["my_dist_sl"], "My Distance to Trail %": h["my_dist_trail"],
+        "My Stop Status (ref)": h["my_stop_status"],
     } for h in account["holdings"]]).round(4)
     my_xl["My_Plan_vs_Actual"] = pd.DataFrame([{
         "Month": r["month"], "Entry Day": r["entry_day"], "Symbol": r["symbol"], "Side": r["side"],
@@ -2010,6 +2034,16 @@ else:
         ("price_diff_pct", "Price vs Close", pct), ("slippage", "₹ vs Close", inr),
         ("status", "Status", None),
     ]
+    _ref_cols = [
+        ("symbol", "Symbol", None), ("qty", "My Qty", str), ("avg_fill", "Avg Fill (excl. charges)", num),
+        ("price", f"Price ({'live ' + live_quote_time if LIVE_VIEW else AS_OF.date()})", num),
+        ("my_peak", "My Peak", num), ("my_hard_sl", "My Hard SL", num), ("my_trail_sl", "My Trailing SL", num),
+        ("my_dist_sl", "Distance to Hard SL %", lambda v: pct(v, False)),
+        ("my_dist_trail", "Distance to Trail %", lambda v: pct(v, False)),
+        ("my_stop_status", "Status (reference)", None),
+    ]
+    _ref_rows = [dict(h, my_stop_status=h["my_stop_status"] + (" · price stale" if h["my_price_stale"] else ""))
+                 for h in _a["holdings"] if h["qty"] and h["avg_fill"] is not None]
     _ok = lambda r: "pos" if r["status"] == "MATCH" else "warn"
     _issues_html = ("" if not account_issues else
                     "<div class='datawarn slim'>⚠ <b>Sheet rows with problems</b> (not used until fixed): "
@@ -2028,6 +2062,13 @@ else:
 <div class="kpis">{_acct_kpis}</div>
 <h3>My holdings vs strategy</h3>
 {table(_a["holdings"], _hold_cols, "tMyHold", _ok, lambda k, r: pn(r[k]) if k in ("upnl", "upnl_pct") else ("sym" if k == "symbol" else ""))}
+<h3>My stop levels from my fills (reference only)</h3>
+<p class='muted'><b>Exits follow the strategy levels</b> (Current Live Positions / Risk Monitor) — these are for
+reference only. My Hard SL = my average fill (excl. charges) × {1 - SL_PCT:.2f}; My Peak starts at my average fill and
+is raised only by entry-day closes after my buy date; My Trailing SL = My Peak × {1 - TRAIL_PCT:.2f}.</p>
+{table(_ref_rows, _ref_cols, "tMyStops", lambda r: "warn" if r["my_stop_status"] != "OK" else "",
+       lambda k, r: ("r" if r[k] <= 0 else "amber" if r[k] <= NEAR_STOP_PCT else "")
+       if k in ("my_dist_sl", "my_dist_trail") else ("sym" if k == "symbol" else ""))}
 <h3>Plan vs actual (each entry day)</h3>
 <p class='muted'>Plan = the strategy record at the entry-day close; actual = your fills for that month in the sheet.</p>
 {table(_a["pva"], _pva_cols, "tPva", _ok, lambda k, r: pn(-r[k]) if k == "price_diff_pct" and r.get("side") == "BUY" and r[k] is not None else ("sym" if k == "symbol" else ""))}"""
@@ -2568,7 +2609,8 @@ amber = exit risk (stop hit, outside top 6, or within {NEAR_STOP_PCT:.0f}% of a 
 {account_html}
 
 <h2>Risk Monitor</h2>
-<p class='muted'>Sorted by the position closest to an exit. Peak includes the latest close.</p>
+<p class='muted'>Sorted by the position closest to an exit. Peak = highest entry-day close since entry (daily
+closes and today's price are not used) — the trailing level the strategy checks on the next entry day.</p>
 {risk_html}
 
 <h2>Current Strategy Signals</h2>
@@ -2698,7 +2740,9 @@ summary = {
         "perf": account["perf"], "perf_live": account["perf_live"], "exec_total": account["exec_total"],
         "exec_latest": account["exec_months"][-1] if account["exec_months"] else None,
         "holdings": [{k: h[k] for k in ("symbol", "qty", "avg_cost", "value", "upnl", "upnl_pct",
-                                         "strategy_qty", "status")} for h in account["holdings"]],
+                                         "strategy_qty", "status", "price", "avg_fill", "my_peak",
+                                         "my_hard_sl", "my_trail_sl", "my_dist_sl", "my_dist_trail",
+                                         "my_stop_status", "my_price_stale")} for h in account["holdings"]],
     },
     "account_error": account_error,
     "data": {

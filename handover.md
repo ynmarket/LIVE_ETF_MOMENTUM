@@ -216,6 +216,23 @@ Exit codes: 2 data, 3 Excel, 4 HTML, 5 summary (mapped to messages by the workfl
   after 30 days); **time-weighted index** vs strategy vs Nifty 500 (deposits are not performance);
   **plan vs actual** per entry month; **execution cost** = (your price − strategy close) × qty (+charges),
   negative = saved.
+* **Reference stop levels from the user's fills** (table "My stop levels from my fills", Excel
+  `My_Holdings` "(ref)" columns, summary `account.holdings[].my_*`): **information only — the user exits on
+  the strategy levels.** My Hard SL = average fill price **excl. charges** × 0.85; My Peak starts at that
+  average fill and is raised **only by entry-day closes after the first buy date** of the holding (rule A,
+  no daily closes, no today's price, the buy-day close itself does not count); My Trailing SL = My Peak ×
+  0.80; current price = live during market hours, else latest close (flagged "price stale" if delayed).
+  Telegram sends **👤 Your account (reference)** when a reference level is hit or within 5 % (de-duplicated
+  in evening runs).
+* **Strategy stop display** (Current Live Positions, Risk Monitor, Telegram ⚠️, `Live_Positions`): Peak =
+  the **stored engine peak** (highest entry-day close since entry) — exactly the level the engine checks on
+  the next entry day. Until 2026-10-08 the page used max(stored peak, today's price), which showed a
+  misleading trail (today × 0.80) for winners; verified on real backtest trades (all 101 recorded peaks =
+  highest entry-day close; SILVERBEES Feb 2026 example). Statuses were never affected. `Hist_Open_Positions`
+  (historical reference) still uses the old display formula — left unchanged on purpose.
+* Decided with the user (2026-10-08): a research run (scratch only, not committed) compared peak/stop
+  methods on the backtest — A current 31.1 % CAGR / −24.8 % DD; B daily peak 31.6 / −24.6; C daily stop
+  30.8 / −20.7; C2 daily stop next-day 29.5 / −21.0. User keeps rule A; strategy unchanged.
 
 ---
 
@@ -275,7 +292,8 @@ Exit codes: 2 data, 3 Excel, 4 HTML, 5 summary (mapped to messages by the workfl
   Hist_Momentum_Scores (22 sheets). **Only produced locally now** (not uploaded from GitHub).
 * **Telegram** (`notify_telegram.py`): 🛒 order plan, ⛔ data incomplete, ✅ entry-day rebalance
   recorded, ⚠️ exit risk (stop hit / within 5% / outside top 6), ⚠️ data delayed, 📊 daily summary (incl.
-  👤 My account, 📈 since start, 🧾 execution vs close), ❌ run failed; evening mode de-duplicates alerts
+  👤 My account, 📈 since start, 🧾 execution vs close), 👤 your account (reference) stop levels from your
+  fills hit/near, ❌ run failed; evening mode de-duplicates alerts
   against the previously published summary; manual runs always send. Reminder script sends 🔔.
 
 ---
@@ -345,6 +363,8 @@ Exit codes: 2 data, 3 Excel, 4 HTML, 5 summary (mapped to messages by the workfl
     cost. M: ranking trend. R: password-protected page.
 12. Privacy hardening (no artifacts with data, encrypted hand-off, public variant, masked logs, privacy check).
 13. Live view: live prices for all current values during market hours (★ live points on charts).
+14. Reference stop levels from the user's own fills in My Account + 👤 Telegram alert (info only; §8);
+    strategy trailing-stop display now shows the stored engine peak (no today's price).
 
 ## 14. What was tried and did NOT work / was reverted (don't repeat)
 

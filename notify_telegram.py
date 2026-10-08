@@ -6,6 +6,7 @@ Reads reports/summary.json (written by ETF_Momentum_Test_1.py) and sends:
   ⛔ data incomplete                        (live prices missing on the entry day — do not trade)
   ✅ rebalance recorded                      (entry day's close, status EXECUTED)
   ⚠️ exit risk                               (stop hit, near a stop, or outside the top 6)
+  👤 your account (reference)                (stop levels from your own fills hit / near — info only)
   ⚠️ data delayed                            (held / top-6 / action ETFs without the latest price)
   📊 daily summary                           (evening and manual runs)
   ❌ run failed                              (--failure)
@@ -238,6 +239,27 @@ def msg_exit_risk(s):
     return "\n".join(lines) + footer()
 
 
+def my_stop_positions(s):
+    """Your holdings whose reference stop (from your own fills) is hit or within the near-stop band."""
+    a = s.get("account") or {}
+    return [h for h in a.get("holdings", []) if h.get("my_stop_status") not in (None, "OK")]
+
+
+def msg_my_stops(s):
+    lines = ["👤 <b>Your account (reference) — stop levels from your fills</b>",
+             (f"Live prices {esc(s['live_quote_time'])} IST" if s.get("live_view")
+              else f"Prices as of {d(s['as_of'])}"), ""]
+    for h in my_stop_positions(s):
+        stale = " · ⚠️ price stale" if h.get("my_price_stale") else ""
+        lines.append(f"• <b>{esc(h['symbol'])}</b> {num(h['price'])} — {esc(h['my_stop_status'])}{stale}")
+        lines.append(f"   Avg fill {num(h['avg_fill'])} · My Hard SL {num(h['my_hard_sl'])} "
+                     f"({pct(h['my_dist_sl'], False)} away) · My Trail {num(h['my_trail_sl'])} "
+                     f"({pct(h['my_dist_trail'], False)} away)")
+    lines += ["", f"Reference only — exits follow the strategy levels on the entry day "
+                  f"({d(s['next_exec_date'])})."]
+    return "\n".join(lines) + footer()
+
+
 def data_affected(s):
     data = s["data"]
     signal_hit = data["stale_signal"] or data["stale_actions"]
@@ -282,6 +304,10 @@ def key_risk(s):
     return sorted((p["symbol"], p["status"]) for p in risky_positions(s))
 
 
+def key_my_stops(s):
+    return sorted((h["symbol"], h["my_stop_status"]) for h in my_stop_positions(s))
+
+
 def key_data(s):
     data = s["data"]
     return (s["as_of"], data_affected(s), sorted(data["stale_held"]), sorted(data["stale_signal"]),
@@ -309,6 +335,8 @@ def build_messages(s, prev, mode):
         msgs.append(msg_executed(s))
     if risky_positions(s) and new(key_risk):
         msgs.append(msg_exit_risk(s))
+    if my_stop_positions(s) and new(key_my_stops):
+        msgs.append(msg_my_stops(s))
     if data_affected(s) and new(key_data):
         msgs.append(msg_data(s))
     if mode in ("evening", "manual"):
