@@ -309,7 +309,12 @@ Exit codes: 2 data, 3 Excel, 4 HTML, 5 summary (mapped to messages by the workfl
   Chart legends carry the current value of each line (Portfolio Value / Invested ₹, Growth of 100 %,
   backtest end values); a small subtitle (`style(..., sub=)`) says which moment (`NOW_TAG`: "live HH:MM
   IST" or "DD Mon close"); ★ live points have no own legend entry; Drawdown subtitle "now · max (closes)";
-  Monthly Returns subtitle "closing prices, to DD Mon".
+  Live Charts: the monthly bar chart was replaced by a **monthly returns heatmap** (years × calendar months,
+  red–white–green centred at 0, value in each cell, * = month to date; same `live_mret` numbers) and an
+  **annual returns** bar chart (live record vs Nifty 500, same calendar periods, closing prices; first year
+  from the live start, current year YTD, marked *). Phones (`fitChartsForDevice`): heatmap months J F M …,
+  values without %, no colour bar. Tested with 1/12/36/72 months on 390 px and 1440 px. The Historical
+  section was intentionally left unchanged (user's choice).
 * **Excel sheets**: Live_Summary, Live_Positions, Live_Actions, Live_Signals, Live_Data_Status,
   Rank_Trend, My_Account, My_Holdings, My_Plan_vs_Actual, My_Trades (backup copy of sheet rows),
   My_Performance, My_Execution_Cost, My_Cash, Live_Closed_Trades, Live_Equity, Live_Rebalances,

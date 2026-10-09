@@ -2472,14 +2472,65 @@ if live_started:
     f_dd.update_layout(yaxis_title="Drawdown %", showlegend=False)
     charts["dd"] = fig_to_div(f_dd)
 
-    mlabels = [ts.strftime("%b %Y") + (" (MTD)" if ts.to_period("M") == AS_OF.to_period("M")
-                                       and AS_OF < ts else "") for ts in live_mret.index]
-    f_m = go.Figure(go.Bar(x=mlabels, y=live_mret.values,
-                           marker_color=[GRN if v >= 0 else RD for v in live_mret.values],
-                           text=[f"{v:+.2f}%" for v in live_mret.values], textposition="outside"))
-    style(f_m, "Live Monthly Returns %", 330, sub=f"closing prices, to {AS_OF:%d %b}")
-    f_m.update_layout(yaxis_title="Return %", showlegend=False)
+    # Monthly returns heatmap (years × calendar months) — same live_mret numbers as before, laid out so it
+    # stays readable for any number of years. * = month to date. Phones: see fitChartsForDevice().
+    _MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    _years = sorted({ts.year for ts in live_mret.index})
+    _z = [[None] * 12 for _ in _years]
+    _txt = [[""] * 12 for _ in _years]
+    _ptxt = [[""] * 12 for _ in _years]                      # phone variant (no % sign)
+    for ts, v in live_mret.items():
+        if pd.isna(v):
+            continue
+        r, c = _years.index(ts.year), ts.month - 1
+        mtd = "*" if ts.to_period("M") == AS_OF.to_period("M") and AS_OF < ts else ""
+        _z[r][c], _txt[r][c], _ptxt[r][c] = float(v), f"{v:.1f}%{mtd}", f"{v:.1f}{mtd}"
+    _zmax = max([abs(v) for row in _z for v in row if v is not None] + [5.0])
+    f_m = go.Figure(go.Heatmap(
+        z=_z, x=_MON, y=[str(y) for y in _years], text=_txt, customdata=_ptxt, texttemplate="%{text}",
+        textfont=dict(size=12), zmid=0, zmin=-_zmax, zmax=_zmax, xgap=2, ygap=2, hoverongaps=False,
+        colorscale=[[0, "#8E1B1B"], [0.35, "#E57373"], [0.5, "#F2F2F2"], [0.65, "#81C784"], [1, "#1B5E20"]],
+        colorbar=dict(title="%", thickness=12, len=0.9),
+        hovertemplate="%{x} %{y}: %{text}<extra></extra>"))
+    style(f_m, "Monthly Returns % (calendar months)", max(230, 130 + 52 * len(_years)),
+          sub=f"closing prices to {AS_OF:%d %b}" + (" · * month to date" if any("*" in t for row in _txt for t in row) else ""))
+    f_m.update_layout(yaxis=dict(autorange="reversed", type="category", showgrid=False, zeroline=False),
+                      xaxis=dict(side="bottom", type="category", showgrid=False, zeroline=False),
+                      showlegend=False)
     charts["mret"] = fig_to_div(f_m)
+
+    # Annual returns: live record vs Nifty 500 over the same calendar periods (closing prices).
+    # First year starts on the live start (entry-day close), the current year is year-to-date.
+    _ye = live_daily["value"].resample("YE").last()
+    _ann_s = _ye.pct_change() * 100
+    _ann_s.iloc[0] = (_ye.iloc[0] / INITIAL_CAPITAL - 1) * 100
+    _ann_b = None
+    _bm_live = bm_raw[(bm_raw.index >= live_init_date) & (bm_raw.index <= AS_OF)] if not bm_raw.empty else bm_raw
+    if len(_bm_live):
+        _bye = _bm_live.resample("YE").last()
+        _ann_b = _bye.pct_change() * 100
+        _ann_b.iloc[0] = (_bye.iloc[0] / float(_bm_live.iloc[0]) - 1) * 100
+    _ylab, _notes = [], []                      # plain year labels (fit on phones); * = partial year
+    for ts in _ann_s.index:
+        parts = ([f"from {live_init_date:%d %b}"] if ts.year == live_init_date.year else []) + \
+                (["YTD"] if ts.year == AS_OF.year else [])
+        _ylab.append(f"{ts.year}" + ("*" if parts else ""))
+        if parts:
+            _notes.append(f"{ts.year} {', '.join(parts)}")
+    f_y = go.Figure(go.Bar(x=_ylab, y=_ann_s.values, name="Strategy (live)",
+                           marker_color=[GRN if v >= 0 else RD for v in _ann_s.values],
+                           text=[f"{v:+.1f}%" for v in _ann_s.values], textposition="outside", cliponaxis=False,
+                           hovertemplate="%{x}<br>Strategy %{y:+.2f}%<extra></extra>"))
+    if _ann_b is not None:
+        f_y.add_trace(go.Bar(x=_ylab, y=[_ann_b.get(ts, float("nan")) for ts in _ann_s.index], name="Nifty 500",
+                             marker_color=GRAY, text=[f"{_ann_b.get(ts, float('nan')):+.1f}%" for ts in _ann_s.index],
+                             textposition="outside", cliponaxis=False,
+                             hovertemplate="%{x}<br>Nifty 500 %{y:+.2f}%<extra></extra>"))
+    style(f_y, "Annual Returns % — strategy vs Nifty 500", 330,
+          sub="closing prices" + (" · * " + "; ".join(_notes) if _notes else ""))
+    f_y.update_layout(barmode="group", yaxis_title="Return %", xaxis=dict(type="category"),
+                      uniformtext=dict(minsize=9, mode="hide"))
+    charts["annual"] = fig_to_div(f_y)
 
 
 def chart(key):
@@ -2487,7 +2538,7 @@ def chart(key):
 
 
 charts_html = (f"<div class='grid2'>{chart('alloc')}{chart('pnl')}</div>{chart('val')}"
-               f"<div class='grid2'>{chart('dd')}{chart('mret')}</div>")
+               f"<div class='grid2'>{chart('dd')}{chart('annual')}</div>{chart('mret')}")
 if not charts_html.replace("<div class='grid2'></div>", ""):
     charts_html = "<p class='muted'>No live history yet.</p>"
 
@@ -2698,9 +2749,14 @@ function fitChartsForDevice() {{
   var small = window.matchMedia('(max-width:700px)').matches;
   var touch = window.matchMedia('(pointer:coarse)').matches;
   document.querySelectorAll('.js-plotly-plot').forEach(function(p) {{
-    var u = {{}}, isPie = p.data && p.data[0] && p.data[0].type === 'pie';
+    var u = {{}}, type = p.data && p.data[0] && p.data[0].type, isPie = type === 'pie', isHeat = type === 'heatmap';
     if (small || touch) {{ u.dragmode = false; if (!isPie) {{ u['xaxis.fixedrange'] = true; u['yaxis.fixedrange'] = true; }} }}
-    if (small && p.layout && p.layout.height > 320) {{
+    if (small && isHeat) {{                         // 12 columns on a phone: J F M …, no % sign, no colour bar
+      Plotly.restyle(p, {{text: [p.data[0].customdata], showscale: false, 'textfont.size': 10}});
+      u['xaxis.tickvals'] = p.data[0].x; u['xaxis.ticktext'] = p.data[0].x.map(function(m) {{ return m.charAt(0); }});
+      u['margin.l'] = 40; u['margin.r'] = 8;
+    }}
+    if (small && !isHeat && p.layout && p.layout.height > 320) {{
       u.height = Math.max(300, Math.round(p.layout.height * 0.8));
       p.style.height = u.height + 'px';            // the chart's own box keeps its old height otherwise
     }}
