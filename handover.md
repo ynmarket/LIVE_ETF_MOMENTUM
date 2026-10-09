@@ -306,6 +306,10 @@ Exit codes: 2 data, 3 Excel, 4 HTML, 5 summary (mapped to messages by the workfl
   My holdings: same ETF/side within ±`MATCH_TOL_PCT` (5 %) of the plan value/qty = "MATCH (size …)"
   (order plan sizes from live prices, record from the close) — reporting only.
   `Hist_Open_Positions` peak/trail now use the stored engine peak. Workflow HTML check: > 150 KB + charts.
+  Chart legends carry the current value of each line (Portfolio Value / Invested ₹, Growth of 100 %,
+  backtest end values); a small subtitle (`style(..., sub=)`) says which moment (`NOW_TAG`: "live HH:MM
+  IST" or "DD Mon close"); ★ live points have no own legend entry; Drawdown subtitle "now · max (closes)";
+  Monthly Returns subtitle "closing prices, to DD Mon".
 * **Excel sheets**: Live_Summary, Live_Positions, Live_Actions, Live_Signals, Live_Data_Status,
   Rank_Trend, My_Account, My_Holdings, My_Plan_vs_Actual, My_Trades (backup copy of sheet rows),
   My_Performance, My_Execution_Cost, My_Cash, Live_Closed_Trades, Live_Equity, Live_Rebalances,

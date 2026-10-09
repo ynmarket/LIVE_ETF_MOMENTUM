@@ -1898,10 +1898,12 @@ def fig_to_div(fig):
     return pyo.plot(fig, include_plotlyjs=False, output_type="div", config=cfg)
 
 
-def style(fig, title, h=400):
-    fig.update_layout(title=dict(text=title, x=0.01, xanchor="left", font=dict(size=15)),
+def style(fig, title, h=400, sub=None):
+    """sub = optional small second title line (Plotly titles do not wrap on phones)."""
+    text = title + (f"<br><span style='font-size:12px;color:{MUTED}'>{sub}</span>" if sub else "")
+    fig.update_layout(title=dict(text=text, x=0.01, xanchor="left", font=dict(size=15)),
                       template="plotly_dark", paper_bgcolor=PANEL, plot_bgcolor=PANEL,
-                      font=dict(color=TXT), height=h, margin=dict(l=55, r=20, t=50, b=40),
+                      font=dict(color=TXT), height=h, margin=dict(l=55, r=20, t=66 if sub else 50, b=40),
                       legend=dict(orientation="h", yanchor="top", y=-0.14, x=0))   # below the chart
     return fig
 
@@ -2112,17 +2114,23 @@ Your order-plan quantities come from live prices, so they rarely equal the close
 side with a value within ±{MATCH_TOL_PCT:.0f}% of the plan shows as <b>MATCH (size …)</b>.</p>
 {table(_a["pva"], _pva_cols, "tPva", _ok, lambda k, r: pn(-r[k]) if k == "price_diff_pct" and r.get("side") == "BUY" and r[k] is not None else ("sym" if k == "symbol" else ""))}"""
 
+# Chart legends show the CURRENT value of each line (no need to tap the chart); NOW_TAG says which moment
+NOW_TAG = f"live {live_quote_time} IST" if LIVE_VIEW else f"{AS_OF:%d %b} close"
+
 if account is not None:
     _a = account
     if _a["daily"]:
         _dd = [r["date"] for r in _a["daily"]]
+        _pv = _a.get("perf_live") or _a["perf"]           # latest values (live during market hours)
         f_acct = go.Figure()
-        f_acct.add_trace(go.Scatter(x=_dd, y=[r["idx"] for r in _a["daily"]], name="My account",
+        f_acct.add_trace(go.Scatter(x=_dd, y=[r["idx"] for r in _a["daily"]], name=f"My account {pct(_pv['account_pct'])}",
                                     mode="lines+markers", line=dict(color=GRN, width=2.5)))
-        f_acct.add_trace(go.Scatter(x=_dd, y=[r["strategy_idx"] for r in _a["daily"]], name="Strategy record",
+        f_acct.add_trace(go.Scatter(x=_dd, y=[r["strategy_idx"] for r in _a["daily"]],
+                                    name=f"Strategy record {pct(_pv['strategy_pct'])}",
                                     mode="lines+markers", line=dict(color=AMBER, width=2)))
         if _a["daily"][0]["nifty_idx"] is not None:
-            f_acct.add_trace(go.Scatter(x=_dd, y=[r["nifty_idx"] for r in _a["daily"]], name="Nifty 500",
+            f_acct.add_trace(go.Scatter(x=_dd, y=[r["nifty_idx"] for r in _a["daily"]],
+                                        name=f"Nifty 500 {pct(_pv['nifty_pct'])}",
                                         mode="lines+markers", line=dict(color=GRAY, dash="dash")))
         _pl = _a.get("perf_live")
         if _pl:                                    # separate, clearly marked live point (not history)
@@ -2130,12 +2138,13 @@ if account is not None:
             for _y, _n, _c in ((_pl["account_idx"], "My account (live)", GRN),
                                (_pl["strategy_idx"], "Strategy (live)", AMBER),
                                (_pl["nifty_idx"], "Nifty 500 (live)", GRAY)):
-                if _y is not None:
+                if _y is not None:                 # its value is already in the legend entry above
                     f_acct.add_trace(go.Scatter(x=_lx, y=[_y], name=f"{_n} {live_quote_time}", mode="markers",
+                                                showlegend=False,
                                                 marker=dict(color=_c, size=13, symbol="star",
                                                             line=dict(color="#fff", width=1))))
         f_acct.add_hline(y=100, line=dict(color=MUTED, dash="dot", width=1))
-        style(f_acct, f"Growth of 100 since {_a['perf']['start']}", 380)
+        style(f_acct, f"Growth of 100 since {_a['perf']['start']}", 380, sub=f"legend values = now ({NOW_TAG})")
         f_acct.update_layout(yaxis_title="Index (start = 100)")
         _perf = _a.get("perf_live") or _a["perf"]
         account_html += f"""
@@ -2436,19 +2445,19 @@ if live_started:
     f_val = go.Figure()
     # Cash is shown in the hover (not as a line): a ~₹500 cash line forced the axis down to 0 and
     # flattened the portfolio line
-    f_val.add_trace(go.Scatter(x=live_daily.index, y=live_daily["value"], name="Portfolio Value",
+    f_val.add_trace(go.Scatter(x=live_daily.index, y=live_daily["value"], name=f"Portfolio Value {inr(live_value)}",
                                line=dict(color=AMBER, width=2.5), customdata=live_daily["cash"],
                                hovertemplate="%{x|%d %b %Y}<br>Value ₹%{y:,.0f}<br>Cash ₹%{customdata:,.0f}"
                                              "<extra></extra>"))
-    f_val.add_trace(go.Scatter(x=live_daily.index, y=live_daily["held"], name="Invested Value",
+    f_val.add_trace(go.Scatter(x=live_daily.index, y=live_daily["held"], name=f"Invested {inr(invested)}",
                                line=dict(color=BLUE, width=1.5)))
     if LIVE_VIEW:                                  # separate, clearly marked live point (not history)
-        f_val.add_trace(go.Scatter(x=[pd.Timestamp(now_ist())], y=[live_value],
+        f_val.add_trace(go.Scatter(x=[pd.Timestamp(now_ist())], y=[live_value], showlegend=False,
                                    name=f"Live {live_quote_time} IST", mode="markers",
                                    marker=dict(color=AMBER, size=14, symbol="star", line=dict(color="#fff", width=1))))
     f_val.add_hline(y=INITIAL_CAPITAL, line=dict(color=MUTED, dash="dash", width=1),
                     annotation_text=f"Initial {inr(INITIAL_CAPITAL)}", annotation_font_color=MUTED)
-    style(f_val, "Live Portfolio Value", 430)
+    style(f_val, "Live Portfolio Value", 430, sub=f"legend values = now ({NOW_TAG})")
     f_val.update_layout(yaxis_title="Portfolio Value ₹", yaxis_tickformat=",.0f")
     charts["val"] = fig_to_div(f_val)
 
@@ -2457,7 +2466,9 @@ if live_started:
                                 fillcolor="rgba(231,76,60,0.35)"))
     f_dd.add_hline(y=live_max_dd, line=dict(color=AMBER, dash="dash"),
                    annotation_text=f"Max live DD {live_max_dd:.2f}%", annotation_font_color=AMBER)
-    style(f_dd, "Live Portfolio Drawdown", 330)
+    _peak_val = max(float(live_daily["value"].max()), live_value)          # display only
+    _dd_now = (live_value / _peak_val - 1) * 100 if LIVE_VIEW else float(live_daily["dd_pct"].iloc[-1])
+    style(f_dd, "Live Portfolio Drawdown", 330, sub=f"now {_dd_now:.2f}% · max {live_max_dd:.2f}% (closes) · {NOW_TAG}")
     f_dd.update_layout(yaxis_title="Drawdown %", showlegend=False)
     charts["dd"] = fig_to_div(f_dd)
 
@@ -2466,7 +2477,7 @@ if live_started:
     f_m = go.Figure(go.Bar(x=mlabels, y=live_mret.values,
                            marker_color=[GRN if v >= 0 else RD for v in live_mret.values],
                            text=[f"{v:+.2f}%" for v in live_mret.values], textposition="outside"))
-    style(f_m, "Live Monthly Returns %", 330)
+    style(f_m, "Live Monthly Returns %", 330, sub=f"closing prices, to {AS_OF:%d %b}")
     f_m.update_layout(yaxis_title="Return %", showlegend=False)
     charts["mret"] = fig_to_div(f_m)
 
@@ -2520,12 +2531,14 @@ rules_html = "".join(f"<tr><td>{a}</td><td>{b}</td></tr>" for a, b in rules)
 
 # ── Historical reference (collapsed, secondary) ─────────────────────────────
 f_hist = go.Figure()
-f_hist.add_trace(go.Scatter(x=daily_df.index, y=daily_df["value"] / INITIAL_CAPITAL * 100,
-                            name="Strategy (backtest)", line=dict(color=AMBER, width=1.5)))
+_hs = daily_df["value"] / INITIAL_CAPITAL * 100
+f_hist.add_trace(go.Scatter(x=daily_df.index, y=_hs, name=f"Strategy (backtest) {_hs.iloc[-1]:,.0f}",
+                            line=dict(color=AMBER, width=1.5)))
 if bm_daily is not None:
-    f_hist.add_trace(go.Scatter(x=bm_daily.index, y=bm_daily / bm_daily.iloc[0] * 100,
-                                name="Nifty 500 B&H", line=dict(color=GRAY, dash="dash")))
-style(f_hist, "Historical backtest (normalised to 100) — reference only", 380)
+    _hb = bm_daily / bm_daily.iloc[0] * 100
+    f_hist.add_trace(go.Scatter(x=bm_daily.index, y=_hb, name=f"Nifty 500 B&H {_hb.iloc[-1]:,.0f}",
+                                line=dict(color=GRAY, dash="dash")))
+style(f_hist, "Historical backtest — reference only", 380, sub=f"start = 100 · legend values at {LAST_DATE.date()}")
 hist_div = fig_to_div(f_hist)
 hist_kpis = "".join(kpi(k, (f"{v:,.2f}" if isinstance(v, float) else str(v))) for k, v in metrics
                     if k in ("CAGR%", "MaxDD% (daily)", "Sharpe", "Sortino", "Calmar", "Volatility%",
