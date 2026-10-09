@@ -51,6 +51,9 @@ Repo: https://github.com/ynmarket/LIVE_ETF_MOMENTUM · Page: https://ynmarket.gi
 8. **Universe changes only exactly as instructed** (a swap was once reverted at the user's request).
 9. Investment decisions are the user's; the system only reports what the strategy rules produce.
 10. When the system changes, **update `handover.md`** (and this file if a rule changes) in the same commit.
+11. **Do not use Claude's local memory** for this project. Anything important (decisions, preferences,
+    research results) goes into `CLAUDE.md` or `handover.md`, so every laptop gets it with `git clone`.
+    (Never put secrets or the user's real account figures there — the repository is public.)
 
 ## Run & test
 

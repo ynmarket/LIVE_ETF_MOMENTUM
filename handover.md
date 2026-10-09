@@ -393,6 +393,14 @@ Exit codes: 2 data, 3 Excel, 4 HTML, 5 summary (mapped to messages by the workfl
 * **First My Account Excel edit** inserted a loop at the wrong indentation and silently dropped sheets —
   always re-check the sheet list after editing `_write_excel()`.
 * **Google Drive connector to find the Sheet ID** → user said ask instead.
+* **Daily trailing stop (researched 2026-10-08/09, scratch only — user keeps the current rule).** Backtest
+  2021-01 → 2026-09: current rule A (peak = entry-day closes, stops checked on entry days) CAGR 31.1 % /
+  max DD −24.8 %. Daily-close or daily-High peak but still checked on entry days: ≈ same (31.6 / 31.4 %).
+  Daily check + sell next day (realistic): 29.5–31.0 % / ≈ −21 %. Daily-High peak + sell same close:
+  33.8 % / −18.0 %, but driven by one event (MONQ50 Sep 2026 crash); worse in 2022 and 2025. Big winners
+  give back ~31 pp on average under A (MONQ50 2026: best +279 % → +86 %); daily stops save sharp crashes
+  but cut winners that dip and recover (SILVERBEES 2025: +104 % → ~+30 %). No clear improvement →
+  **do not re-propose unless the user asks.**
 
 ---
 
