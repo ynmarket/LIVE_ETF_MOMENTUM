@@ -210,6 +210,11 @@ def msg_order_plan(s):
 
 def msg_incomplete(s):
     miss = s.get("signal_missing", [])
+    if s.get("no_live_today"):
+        return "\n".join(["⛔ <b>NO LIVE PRICES TODAY — do not trade on this order plan</b>",
+                          "Yahoo has no prices at all for today: most likely an NSE holiday (the entry day then "
+                          "moves to the next trading session), or Yahoo is not updated yet.",
+                          "Re-run the workflow in a few minutes to check."]) + footer()
     lines = ["⛔ <b>DATA INCOMPLETE — do not trade on this order plan</b>",
              f"{len(miss)} ETFs have no live price on Yahoo: " + ", ".join(esc(x) for x in miss),
              "The ranking would use yesterday's close for them and may be wrong.",
@@ -246,7 +251,9 @@ def risky_positions(s):
 
 
 def msg_exit_risk(s):
-    lines = ["⚠️ <b>Exit risk</b>", f"Prices as of {d(s['as_of'])}", ""]
+    lines = ["⚠️ <b>Exit risk</b>",
+             (f"Live prices {esc(s['live_quote_time'])} IST" if s.get("live_view")
+              else f"Prices as of {d(s['as_of'])}"), ""]
     for p in risky_positions(s):
         why = p["status"].replace("EXIT RISK — ", "")
         lines.append(f"• <b>{esc(p['symbol'])}</b> {num(p['price'])} — {esc(why)}")

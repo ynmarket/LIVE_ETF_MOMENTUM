@@ -79,7 +79,9 @@ jobs:
           xlsx=reports/ETF_Momentum_Test_1_Report.xlsx
           test -f "$html" || { echo "::error title=File/path problem::$html was not created"; exit 1; }
           size=$(stat -c %s "$html")
-          [ "$size" -gt 1000000 ] || { echo "::error title=HTML generation problem::$html is only $size bytes"; exit 1; }
+          # Plotly.js is loaded from a CDN (not embedded), so a complete page is ~0.5 MB
+          [ "$size" -gt 150000 ] || { echo "::error title=HTML generation problem::$html is only $size bytes"; exit 1; }
+          grep -q "js-plotly-plot\|Plotly.newPlot" "$html" || { echo "::error title=HTML generation problem::no charts in $html"; exit 1; }
           grep -q "Live Portfolio Dashboard" "$html" || { echo "::error title=HTML generation problem::dashboard title not found in $html"; exit 1; }
           test -f "$xlsx" || { echo "::error title=Excel generation problem::$xlsx was not created"; exit 1; }
           python -c "import json; json.load(open('reports/summary.json'))" || { echo "::error title=Summary file problem::reports/summary.json missing or invalid"; exit 1; }

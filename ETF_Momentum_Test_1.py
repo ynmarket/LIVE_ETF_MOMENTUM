@@ -26,7 +26,9 @@ for _p, _i in [("yfinance", "yfinance"), ("pandas", "pandas"), ("numpy", "numpy"
                ("requests", "requests")]:
     _ensure(_p, _i)
 
+import base64
 import copy
+import hashlib
 import html as htmlmod
 import json
 import math
@@ -599,9 +601,9 @@ def open_positions_df(res, as_of):
                          unrealised_pnl_inr=round(val - cost, 2),
                          unrealised_pnl_pct=round((cur / p["entry_price"] - 1) * 100, 2),
                          hold_days=(as_of - p["entry_date"]).days,
-                         peak_price=round(max(p["peak"], cur), 4),
+                         peak_price=round(p["peak"], 4),       # stored peak = the level the engine checks
                          sl_level=round(p["entry_price"] * (1 - SL_PCT), 4),
-                         trail_level=round(max(p["peak"], cur) * (1 - TRAIL_PCT), 4)))
+                         trail_level=round(p["peak"] * (1 - TRAIL_PCT), 4)))
     return pd.DataFrame(rows)
 
 
@@ -945,9 +947,14 @@ signal_source = ("live" if act_mode in ("orderplan", "incomplete")
                  else (_rec_now or {}).get("decided_from", "entry-day close") if executed_today else "latest close")
 order_plan_missing_quotes = [a["symbol"] for a in act_log
                              if order_plan and a["action"] in ("BUY", "SELL", "HOLD") and a["symbol"] not in live_quotes]
-if MARKET_HOURS:
+# Market hours by the clock, but Yahoo has no bar for today at all (NSE holiday, or not updated yet)
+NO_LIVE_TODAY = bool(MARKET_HOURS and not live_quotes)
+if LIVE_VIEW:
     print(f"\n  [MARKET OPEN] Today's ({TODAY.date()}) prices are live quotes, not closes — excluded from "
           f"the price history; data shown up to {AS_OF.date()}.")
+elif NO_LIVE_TODAY:
+    print(f"\n  [NO LIVE PRICES] Market hours, but Yahoo has no prices for today ({TODAY.date()}) — NSE holiday, "
+          f"or Yahoo not updated yet; values use the {AS_OF.date()} close.")
 if order_plan and not signal_incomplete:
     print(f"  [ORDER PLAN] Entry day {TODAY.date()}: signal and quantities from live prices at "
           f"{live_quote_time} IST — NOT recorded until today's close")
@@ -1123,7 +1130,7 @@ print("═" * 60)
 # ── Ranking trend (reporting only): each ETF's rank on recent entry days + now ──
 # Ranks are the strategy's own momentum ranks on each entry day: the historical backtest for past
 # months and the live record for live months (same rules); "now" = latest close, or the live
-# ranking during the entry-day order plan.
+# ranking whenever live prices are used (market hours).
 RANK_TREND_DAYS = 6
 _rank_by_day = {}
 for _r in bt["scores"]:
@@ -1153,6 +1160,7 @@ for _sym in cur_ranked:
 LOCAL_CONFIG_PATH = BASE_DIR / "local_config.json"
 KEY_DIRS = [BASE_DIR / "keys", BASE_DIR.parent / "keys"]   # <project>/keys (git-ignored) or a sibling keys/
 XIRR_MIN_DAYS = 30                                # annualising a few days' return is meaningless
+MATCH_TOL_PCT = 5.0                               # reporting only: size difference shown as a match
 SHEET_EPOCH = datetime(1899, 12, 30)              # Google Sheets serial-date day 0
 TRADE_COLS = {"date": "Trade Date", "symbol": "Symbol", "side": "Side", "qty": "Quantity",
               "price": "Price", "charges": "Charges ₹", "month": "Entry Month", "order_id": "Order ID",
@@ -1474,7 +1482,8 @@ def build_account(trades, cash_moves, issues):
             upnl_pct=((value / h["cost"] - 1) * 100) if value is not None and h["cost"] else None,
             strategy_qty=sq, qty_diff=h["qty"] - sq,
             status=("MATCH" if h["qty"] == sq else "NOT IN STRATEGY" if sq == 0
-                    else "NOT HELD" if h["qty"] == 0 else "QTY DIFF")))
+                    else "NOT HELD" if h["qty"] == 0
+                    else "MATCH (size diff)" if abs(h["qty"] / sq - 1) * 100 <= MATCH_TOL_PCT else "QTY DIFF")))
     deposits = sum(c["amount"] for c in cash_moves if c["type"] == "Deposit")
     withdrawals = sum(c["amount"] for c in cash_moves if c["type"] == "Withdrawal")
     income = sum(c["amount"] for c in cash_moves if c["type"] in ("Dividend", "Interest"))
@@ -1508,8 +1517,14 @@ def build_account(trades, cash_moves, issues):
             for (sym, side) in sorted(set(plan) | set(actual), key=lambda k: (k[1], cur_rank.get(k[0], 999))):
                 p, a = plan.get((sym, side)), actual.get((sym, side))
                 a_avg = a["value"] / a["qty"] if a else None
+                # Reporting only: the order plan sizes from live prices, the plan record from the close, so
+                # quantities rarely match exactly — a value within ±MATCH_TOL_PCT % counts as a match.
+                _vdiff = (a["value"] / (p["qty"] * p["price"]) - 1) * 100 if p and a and p["qty"] else None
                 status = ("NOT DONE" if a is None else "NOT IN PLAN" if p is None
-                          else "MATCH" if a["qty"] == p["qty"] else f"QTY DIFF ({a['qty'] - p['qty']:+d})")
+                          else "MATCH" if a["qty"] == p["qty"]
+                          else f"MATCH (size {a['qty'] - p['qty']:+d}, value {_vdiff:+.1f}%)"
+                          if _vdiff is not None and abs(_vdiff) <= MATCH_TOL_PCT
+                          else f"QTY DIFF ({a['qty'] - p['qty']:+d})")
                 # Execution vs the strategy close, in ₹ (+ = cost: bought higher / sold lower; − = saved)
                 slip = ((a_avg - p["price"]) * a["qty"] * (1 if side == "BUY" else -1)) if p and a else None
                 pva.append(dict(month=month, entry_day=ed.date(), symbol=sym, side=side,
@@ -1571,7 +1586,7 @@ def build_account(trades, cash_moves, issues):
         xirr=xirr, xirr_days=xirr_days, perf=perf, daily=daily, unpriced=sorted(unpriced),
         exec_months=exec_months, exec_total=cum if exec_months else None,
         holdings=holdings, pva=pva, latest_month=latest_month,
-        latest_mismatches=sum(r["status"] != "MATCH" for r in latest),
+        latest_mismatches=sum(not r["status"].startswith("MATCH") for r in latest),
         latest_entered=any(r["actual_qty"] for r in latest),
         capital=capital, capital_assumed=capital_assumed, deposits=deposits, withdrawals=withdrawals,
         income=income, cash=cash_bal, market_value=mv, invested=invested_open, upnl=upnl,
@@ -1868,18 +1883,26 @@ print(f"  → {EXCEL_PATH}")
 BG, PANEL, TXT, MUTED = "#0D1B2A", "#1B2A3A", "#F0F0F0", "#9AA8B6"
 AMBER, GRAY, GRN, RD, BLUE = "#F5A623", "#9E9E9E", "#2ECC71", "#E74C3C", "#5DADE2"
 
-PLOTLY_JS = pyo.get_plotlyjs()          # embedded once in <head>: works offline, no CDN
+# Plotly.js is loaded once in <head> from a CDN (same version as the Python package, pinned with an
+# integrity hash; second CDN as fallback). Embedding it made the page ~5 MB, and the encrypted page
+# (not compressible) ~6.7 MB on every visit; from a CDN it is downloaded once and cached.
+PLOTLY_JS_VERSION = pyo.get_plotlyjs_version()
+# The bundled plotly.min.js is byte-identical to the CDN file → its hash is the integrity check
+PLOTLY_SRI = "sha384-" + base64.b64encode(hashlib.sha384(pyo.get_plotlyjs().encode("utf-8")).digest()).decode()
+PLOTLY_CDNS = [f"https://cdnjs.cloudflare.com/ajax/libs/plotly.js/{PLOTLY_JS_VERSION}/plotly.min.js",
+               f"https://cdn.jsdelivr.net/npm/plotly.js-dist-min@{PLOTLY_JS_VERSION}/plotly.min.js"]
 
 
 def fig_to_div(fig):
-    cfg = {"responsive": True, "displaylogo": False}
+    cfg = {"responsive": True, "displaylogo": False, "scrollZoom": False}
     return pyo.plot(fig, include_plotlyjs=False, output_type="div", config=cfg)
 
 
 def style(fig, title, h=400):
-    fig.update_layout(title=title, template="plotly_dark", paper_bgcolor=PANEL, plot_bgcolor=PANEL,
-                      font=dict(color=TXT), height=h, margin=dict(l=60, r=25, t=55, b=45),
-                      legend=dict(orientation="h", y=1.1, x=0))
+    fig.update_layout(title=dict(text=title, x=0.01, xanchor="left", font=dict(size=15)),
+                      template="plotly_dark", paper_bgcolor=PANEL, plot_bgcolor=PANEL,
+                      font=dict(color=TXT), height=h, margin=dict(l=55, r=20, t=50, b=40),
+                      legend=dict(orientation="h", yanchor="top", y=-0.14, x=0))   # below the chart
     return fig
 
 
@@ -2040,7 +2063,7 @@ else:
         ("qty_diff", "Diff", lambda v: f"{v:+d}" if v else "0"), ("status", "Status", None),
     ]
     _pva_cols = [
-        ("month", "Month", None), ("symbol", "Symbol", None), ("side", "Side", None),
+        ("symbol", "Symbol", None), ("month", "Month", None), ("side", "Side", None),
         ("plan_qty", "Plan Qty", lambda v: "—" if v is None else str(v)),
         ("plan_price", "Plan Price (close)", num),
         ("actual_qty", "Actual Qty", lambda v: "—" if v is None else str(v)),
@@ -2058,7 +2081,7 @@ else:
     ]
     _ref_rows = [dict(h, my_stop_status=h["my_stop_status"] + (" · price stale" if h["my_price_stale"] else ""))
                  for h in _a["holdings"] if h["qty"] and h["avg_fill"] is not None]
-    _ok = lambda r: "pos" if r["status"] == "MATCH" else "warn"
+    _ok = lambda r: "pos" if r["status"].startswith("MATCH") else "warn"
     _issues_html = ("" if not account_issues else
                     "<div class='datawarn slim'>⚠ <b>Sheet rows with problems</b> (not used until fixed): "
                     + "; ".join(f"row {i['row']}: {htmlmod.escape(i['problem'])}" for i in account_issues) + "</div>")
@@ -2084,7 +2107,9 @@ is raised only by entry-day closes after my buy date; My Trailing SL = My Peak �
        lambda k, r: ("r" if r[k] <= 0 else "amber" if r[k] <= NEAR_STOP_PCT else "")
        if k in ("my_dist_sl", "my_dist_trail") else ("sym" if k == "symbol" else ""))}
 <h3>Plan vs actual (each entry day)</h3>
-<p class='muted'>Plan = the strategy record at the entry-day close; actual = your fills for that month in the sheet.</p>
+<p class='muted'>Plan = the strategy record at the entry-day close; actual = your fills for that month in the sheet.
+Your order-plan quantities come from live prices, so they rarely equal the close-based plan exactly: the same ETF and
+side with a value within ±{MATCH_TOL_PCT:.0f}% of the plan shows as <b>MATCH (size …)</b>.</p>
 {table(_a["pva"], _pva_cols, "tPva", _ok, lambda k, r: pn(-r[k]) if k == "price_diff_pct" and r.get("side") == "BUY" and r[k] is not None else ("sym" if k == "symbol" else ""))}"""
 
 if account is not None:
@@ -2110,8 +2135,8 @@ if account is not None:
                                                 marker=dict(color=_c, size=13, symbol="star",
                                                             line=dict(color="#fff", width=1))))
         f_acct.add_hline(y=100, line=dict(color=MUTED, dash="dot", width=1))
-        style(f_acct, f"Growth of 100 since {_a['perf']['start']} — my account (time-weighted) vs strategy vs Nifty 500", 380)
-        f_acct.update_layout(yaxis_title="Index (start = 100)", xaxis_title="Date")
+        style(f_acct, f"Growth of 100 since {_a['perf']['start']}", 380)
+        f_acct.update_layout(yaxis_title="Index (start = 100)")
         _perf = _a.get("perf_live") or _a["perf"]
         account_html += f"""
 <h3>My account vs strategy vs Nifty 500</h3>
@@ -2136,9 +2161,9 @@ live_start_label = str(live_init_date.date()) if live_started else LIVE_START_DA
 state_note = ("" if live_started else
               f"<div class='note'>Live portfolio has not started yet — no market data on/after "
               f"{LIVE_START_DATE}. Figures below show a fresh ₹{INITIAL_CAPITAL:,} portfolio and the "
-              f"initialisation preview using the latest data ({AS_OF.date()}). The real initial signal "
-              f"uses the close of the trading day before the first session on/after {LIVE_START_DATE}, "
-              f"and the purchases execute on that first session.</div>")
+              f"initialisation preview using the latest data ({AS_OF.date()}). The first session on/after "
+              f"{LIVE_START_DATE} is the first entry day: signal and purchases at that day's close (order "
+              f"plan from live prices during market hours).</div>")
 
 kpis_port = "".join([
     kpi("Initial Capital", inr(INITIAL_CAPITAL)),
@@ -2151,9 +2176,7 @@ kpis_port = "".join([
     kpi("Positions", f"{len(pos_rows)} / {N_HOLD}"),
 ])
 
-kpis_perf = "".join([
-    kpi("Live Return %", pct(live_ret), pn(live_ret)),
-    kpi("Live P&L", inr(live_pnl), pn(live_pnl)),
+kpis_perf = "".join([                     # return / P&L are in the top cards (not repeated here)
     kpi("Live Max Drawdown", pct(live_max_dd, False) if live_max_dd is not None else "—",
         "r" if live_max_dd else ""),
     kpi("Winning Months", str(win_months)),
@@ -2189,11 +2212,13 @@ out_html = act_lines([dict(symbol=s, rank=cur_rank[s], score=cur_sc[s]["score"],
                      lambda a: f"<b>{a['symbol']}</b><span>#{a['rank']} · score {num(a['score'])} · "
                                f"{'above' if a['above'] else 'below'} DMA</span>")
 _exp = lambda known: "" if known else " (expected)"
-market_html = ("" if not MARKET_HOURS else
-               f"<div class='marketopen'>🟢 <b>Market open — live prices {live_quote_time} IST</b>. Current values "
+market_html = (f"<div class='marketopen'>🟢 <b>Market open — live prices {live_quote_time} IST</b>. Current values "
                f"(positions, P&amp;L, stops, signals, ranking, My Account) use today's live Yahoo prices; ETFs "
                f"without a live quote use the {AS_OF.date()} close. Live prices are never recorded as closes: "
-               f"history charts use closing prices plus a ★ live point.</div>")
+               f"history charts use closing prices plus a ★ live point.</div>" if LIVE_VIEW else
+               f"<div class='marketopen nolive'>⚪ <b>No live prices today</b> — it is market hours, but Yahoo has no "
+               f"prices for {TODAY.date()} (NSE holiday, or Yahoo not updated yet). All values use the "
+               f"{AS_OF.date()} close.</div>" if NO_LIVE_TODAY else "")
 if act_mode == "orderplan":
     act_banner = (f"🛒 ORDER PLAN — entry day {TODAY.date()} · signal and quantities from live prices at "
                   f"{live_quote_time} IST · NOT recorded yet")
@@ -2204,6 +2229,12 @@ if act_mode == "orderplan":
                    + (f" No live quote for: {', '.join(order_plan_missing_quotes)} — last close used."
                       if order_plan_missing_quotes else ""))
     act_prefix = "ORDER"
+elif act_mode == "incomplete" and NO_LIVE_TODAY:
+    act_banner = "⛔ NO LIVE PRICES TODAY — do not trade on this order plan"
+    act_caption = (f"Yahoo has no prices at all for {TODAY.date()}: most likely an NSE holiday (the entry day then "
+                   f"moves to the next trading session), or Yahoo is not updated yet — re-run the workflow in a few "
+                   f"minutes to check.")
+    act_prefix = "UNRELIABLE"
 elif act_mode == "incomplete":
     act_banner = "⛔ DATA INCOMPLETE — do not trade on this order plan"
     act_caption = (f"{len(signal_missing)} ETFs have no live price on Yahoo ({', '.join(signal_missing)}), so the "
@@ -2243,18 +2274,19 @@ actions_html = f"""
 </div>"""
 
 # ── Tables ───────────────────────────────────────────────────────────────────
+# Column order: the most important columns first (Symbol stays fixed when a table scrolls sideways)
 pos_cols = [
-    ("rank", "Rank", lambda v: "—" if v is None else str(v)), ("symbol", "Symbol", None),
-    ("category", "Category", None), ("score", "Momentum Score", num),
-    ("r1", "1M", pct), ("r3", "3M", pct), ("r6", "6M", pct), ("r12", "12M", pct),
-    ("dma", "200 DMA", num), ("price", "Current Price", num), ("above_dma", "Above 200 DMA", yn),
-    ("entry_date", "Entry Date", None), ("entry_price", "Entry Price", num), ("qty", "Qty", str),
-    ("cost", "Cost", inr), ("value", "Current Value", inr), ("pnl", "Unrealised P&L ₹", inr),
-    ("pnl_pct", "Unrealised P&L %", pct), ("hold_days", "Hold Days", str),
+    ("symbol", "Symbol", None), ("status", "Status", badge), ("price", "Current Price", num),
+    ("pnl_pct", "Unrealised P&L %", pct), ("pnl", "Unrealised P&L ₹", inr),
     ("hard_sl", "Hard SL", num), ("trail_sl", "Trailing SL", num),
     ("dist_sl", "Distance to SL %", lambda v: pct(v, False)),
     ("dist_trail", "Distance to Trail %", lambda v: pct(v, False)),
-    ("weight", "Position Weight %", lambda v: pct(v, False)), ("status", "Status", badge),
+    ("rank", "Rank", lambda v: "—" if v is None else str(v)), ("value", "Current Value", inr),
+    ("weight", "Position Weight %", lambda v: pct(v, False)), ("qty", "Qty", str),
+    ("entry_price", "Entry Price", num), ("entry_date", "Entry Date", None), ("cost", "Cost", inr),
+    ("hold_days", "Hold Days", str), ("score", "Momentum Score", num),
+    ("r1", "1M", pct), ("r3", "3M", pct), ("r6", "6M", pct), ("r12", "12M", pct),
+    ("dma", "200 DMA", num), ("above_dma", "Above 200 DMA", yn), ("category", "Category", None),
     ("price_date", "Price Date", lambda v: pxdate(v)),
 ]
 
@@ -2284,12 +2316,13 @@ for r in risk_rows:
     r["nearest"] = "Hard SL" if r["dist_sl"] <= r["dist_trail"] else "Trailing SL"
     r["cushion"] = min(r["dist_sl"], r["dist_trail"])
 risk_cols = [
-    ("symbol", "Symbol", None), ("price", "Current Price", num), ("entry_price", "Entry Price", num),
-    ("peak", "Peak Price", num), ("hard_sl", "Hard SL", num), ("trail_sl", "Trailing SL", num),
+    ("symbol", "Symbol", None), ("nearest", "Nearest Stop", None),
+    ("cushion", "Cushion %", lambda v: pct(v, False)), ("status", "Status", badge),
+    ("price", "Current Price", num), ("hard_sl", "Hard SL", num), ("trail_sl", "Trailing SL", num),
     ("dist_sl", "Distance to Hard SL %", lambda v: pct(v, False)),
     ("dist_trail", "Distance to Trailing SL %", lambda v: pct(v, False)),
-    ("nearest", "Nearest Stop", None), ("cushion", "Cushion %", lambda v: pct(v, False)),
-    ("status", "Status", badge), ("price_date", "Price Date", lambda v: pxdate(v)),
+    ("entry_price", "Entry Price", num), ("peak", "Peak Price", num),
+    ("price_date", "Price Date", lambda v: pxdate(v)),
 ]
 risk_html = table(risk_rows, risk_cols, "tRisk",
                   lambda r: "warn" if r["cushion"] <= NEAR_STOP_PCT else "",
@@ -2297,16 +2330,17 @@ risk_html = table(risk_rows, risk_cols, "tRisk",
                   if k in ("dist_sl", "dist_trail", "cushion") else ("sym" if k == "symbol" else ""))
 
 sig_cols = [
-    ("rank", "Rank", str), ("symbol", "Symbol", None), ("category", "Category", None),
-    ("score", "Momentum Score", num), ("r1", "1M %", pct), ("r3", "3M %", pct), ("r6", "6M %", pct),
-    ("r12", "12M %", pct), ("dma", "200 DMA", num), ("price", "Current Price", num),
-    ("above_dma", "Above 200 DMA", yn), ("held", "Currently Held", yn), ("signal", "Signal", badge),
+    ("symbol", "Symbol", None), ("rank", "Rank", str), ("signal", "Signal", badge),
+    ("score", "Momentum Score", num), ("price", "Current Price", num), ("dma", "200 DMA", num),
+    ("above_dma", "Above 200 DMA", yn), ("held", "Currently Held", yn),
     ("target", "Target Allocation", inr), ("est_qty", "Est. Qty", lambda v: "—" if v is None else str(v)),
-    ("price_date", "Price Date", lambda v: pxdate(v)),
+    ("r1", "1M %", pct), ("r3", "3M %", pct), ("r6", "6M %", pct), ("r12", "12M %", pct),
+    ("category", "Category", None), ("price_date", "Price Date", lambda v: pxdate(v)),
 ]
+SIG_SHOW = 15                                 # rows shown before "Show all"
 signals_html = table(
     sig_rows, sig_cols, "tSig",
-    lambda r: "top" if r["rank"] <= N_HOLD else "",
+    lambda r: ("top" if r["rank"] <= N_HOLD else "") + (" more" if r["rank"] > SIG_SHOW else ""),
     lambda k, r: ("g" if r[k] else "r") if k == "above_dma" else
     (pn(r[k]) if k in ("r1", "r3", "r6", "r12") else ("sym" if k == "symbol" else "")))
 
@@ -2314,13 +2348,12 @@ signals_html = table(
 _trend_rows = [dict(now=r["now"], symbol=r["symbol"], category=r["category"], change=r["change"],
                     held=r["held"], **{f"r{i}": rk for i, rk in enumerate(r["ranks"])})
                for r in rank_trend if (r["now"] or 999) <= 15 or r["held"]]
-_trend_cols = ([("now", "Now" + (" (live)" if order_plan else ""), str), ("symbol", "Symbol", None),
-                ("category", "Category", None)]
+_trend_cols = ([("symbol", "Symbol", None), ("now", "Now" + (f" (live {live_quote_time})" if LIVE_VIEW else ""), str),
+                ("change", "Change", lambda v: "—" if v is None else ("↑" if v > 0 else "↓" if v < 0 else "=")
+                 + (str(abs(v)) if v else ""))]
                + [(f"r{i}", d.strftime("%d %b %y"), lambda v: "—" if v is None else str(v))
-                  for i, d in enumerate(trend_days)]
-               + [("change", "Change", lambda v: "—" if v is None else ("↑" if v > 0 else "↓" if v < 0 else "=")
-                   + (str(abs(v)) if v else "")),
-                  ("held", "Held", yn)])
+                  for i, d in reversed(list(enumerate(trend_days)))]           # newest entry day first
+               + [("held", "Held", yn), ("category", "Category", None)])
 
 
 def _trend_cell(k, r):
@@ -2335,7 +2368,7 @@ def _trend_cell(k, r):
 rank_trend_html = table(_trend_rows, _trend_cols, "tTrend", lambda r: "top" if r["held"] else "", _trend_cell)
 
 trade_cols = [
-    ("trade_id", "Trade #", str), ("symbol", "Symbol", None), ("category", "Category", None),
+    ("symbol", "Symbol", None), ("trade_id", "Trade #", str), ("category", "Category", None),
     ("entry_date", "Entry Date", None), ("exit_date", "Exit Date", None),
     ("entry_price", "Entry Price", num), ("exit_price", "Exit Price", num), ("qty", "Qty", str),
     ("cost", "Cost ₹", inr), ("proceeds", "Proceeds ₹", inr), ("pnl_inr", "P&L ₹", inr),
@@ -2389,23 +2422,26 @@ if pos_rows or live_cash > 0:
     f_alloc.update_layout(showlegend=False)
     charts["alloc"] = fig_to_div(f_alloc)
 if pos_rows:
-    f_pnl = go.Figure(go.Bar(
-        x=[r["symbol"] for r in pos_rows], y=[r["pnl"] for r in pos_rows],
-        marker_color=[GRN if r["pnl"] >= 0 else RD for r in pos_rows],
-        customdata=[[r["pnl_pct"], r["value"]] for r in pos_rows],
-        text=[f"{r['pnl_pct']:+.1f}%" for r in pos_rows], textposition="outside",
-        hovertemplate="%{x}<br>P&L ₹%{y:,.0f}<br>P&L %{customdata[0]:+.2f}%<br>Value ₹%{customdata[1]:,.0f}<extra></extra>"))
+    f_pnl = go.Figure(go.Bar(                     # horizontal: symbol names stay readable on phones
+        y=[f"{r['symbol']}  {r['pnl_pct']:+.1f}%" for r in pos_rows], x=[r["pnl"] for r in pos_rows],
+        orientation="h", marker_color=[GRN if r["pnl"] >= 0 else RD for r in pos_rows],
+        customdata=[[r["symbol"], r["pnl_pct"], r["value"]] for r in pos_rows],
+        hovertemplate="%{customdata[0]}<br>P&L ₹%{x:,.0f}<br>P&L %{customdata[1]:+.2f}%<br>"
+                      "Value ₹%{customdata[2]:,.0f}<extra></extra>"))
     style(f_pnl, "Position P&L (unrealised ₹)", 420)
-    f_pnl.update_layout(yaxis_title="Unrealised P&L ₹", showlegend=False)
+    f_pnl.update_layout(xaxis_title="Unrealised P&L ₹", showlegend=False,
+                        yaxis=dict(autorange="reversed", automargin=True))
     charts["pnl"] = fig_to_div(f_pnl)
 if live_started:
     f_val = go.Figure()
+    # Cash is shown in the hover (not as a line): a ~₹500 cash line forced the axis down to 0 and
+    # flattened the portfolio line
     f_val.add_trace(go.Scatter(x=live_daily.index, y=live_daily["value"], name="Portfolio Value",
-                               line=dict(color=AMBER, width=2.5)))
+                               line=dict(color=AMBER, width=2.5), customdata=live_daily["cash"],
+                               hovertemplate="%{x|%d %b %Y}<br>Value ₹%{y:,.0f}<br>Cash ₹%{customdata:,.0f}"
+                                             "<extra></extra>"))
     f_val.add_trace(go.Scatter(x=live_daily.index, y=live_daily["held"], name="Invested Value",
                                line=dict(color=BLUE, width=1.5)))
-    f_val.add_trace(go.Scatter(x=live_daily.index, y=live_daily["cash"], name="Cash",
-                               line=dict(color=GRAY, width=1, dash="dot")))
     if LIVE_VIEW:                                  # separate, clearly marked live point (not history)
         f_val.add_trace(go.Scatter(x=[pd.Timestamp(now_ist())], y=[live_value],
                                    name=f"Live {live_quote_time} IST", mode="markers",
@@ -2413,7 +2449,7 @@ if live_started:
     f_val.add_hline(y=INITIAL_CAPITAL, line=dict(color=MUTED, dash="dash", width=1),
                     annotation_text=f"Initial {inr(INITIAL_CAPITAL)}", annotation_font_color=MUTED)
     style(f_val, "Live Portfolio Value", 430)
-    f_val.update_layout(xaxis_title="Date", yaxis_title="Portfolio Value ₹", yaxis_tickformat=",.0f")
+    f_val.update_layout(yaxis_title="Portfolio Value ₹", yaxis_tickformat=",.0f")
     charts["val"] = fig_to_div(f_val)
 
     f_dd = go.Figure(go.Scatter(x=live_daily.index, y=live_daily["dd_pct"], fill="tozeroy",
@@ -2422,7 +2458,7 @@ if live_started:
     f_dd.add_hline(y=live_max_dd, line=dict(color=AMBER, dash="dash"),
                    annotation_text=f"Max live DD {live_max_dd:.2f}%", annotation_font_color=AMBER)
     style(f_dd, "Live Portfolio Drawdown", 330)
-    f_dd.update_layout(xaxis_title="Date", yaxis_title="Drawdown %")
+    f_dd.update_layout(yaxis_title="Drawdown %", showlegend=False)
     charts["dd"] = fig_to_div(f_dd)
 
     mlabels = [ts.strftime("%b %Y") + (" (MTD)" if ts.to_period("M") == AS_OF.to_period("M")
@@ -2505,38 +2541,66 @@ hist_html = f"""
  <div class='card'>{hist_div}</div>
 </details>"""
 
+_status_cls = {"EXECUTED": "g", "ORDER PLAN": "amber", "ENTRY DAY": "amber", "PENDING": "", "INCOMPLETE": "r"}[signal_status]
+_nav = [("actions", "Actions"), ("positions", "Positions"), ("account", "My Account"), ("risk", "Risk"),
+        ("signals", "Signals"), ("trend", "Ranking"), ("perf", "Performance"), ("next", "Next Entry"),
+        ("charts", "Charts"), ("history", "History"), ("trades", "Closed Trades"), ("rules", "Rules")]
+nav_html = "".join(f"<a href='#{k}'>{t}</a>" for k, t in _nav)
+_plotly_tags = (f'<script src="{PLOTLY_CDNS[0]}" integrity="{PLOTLY_SRI}" crossorigin="anonymous"></script>\n'
+                f'<script>window.Plotly || document.write(\'<script src="{PLOTLY_CDNS[1]}" integrity="{PLOTLY_SRI}" '
+                f'crossorigin="anonymous"><\\/script>\')</script>')
+
+
+def _sec(sid, title, body, note=""):
+    """Collapsible section (closed by default) — the nav bar opens it when clicked."""
+    return (f"<details class='sec' id='{sid}'><summary><h2>{title}</h2>"
+            f"<span class='muted'>{note}</span></summary>{body}</details>")
+
+
 page_html = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ETF Momentum Live Dashboard</title>
 <style>
  * {{ box-sizing:border-box; }}
- body {{ background:{BG}; color:{TXT}; font-family:Segoe UI,Roboto,Arial,sans-serif; margin:0; padding:24px; }}
+ html {{ scroll-behavior:smooth; -webkit-text-size-adjust:100%; }}
+ body {{ background:{BG}; color:{TXT}; font-family:Segoe UI,Roboto,Arial,sans-serif; margin:0; padding:0 24px 24px; }}
  .wrap {{ max-width:1500px; margin:0 auto; }}
- h1 {{ margin:0 0 6px; font-size:26px; }}
- h2 {{ font-size:18px; letter-spacing:.3px; border-bottom:1px solid #2E4053; padding-bottom:6px; margin:34px 0 12px; }}
+ h1 {{ margin:18px 0 8px; font-size:24px; line-height:1.25; }}
+ h2 {{ font-size:18px; letter-spacing:.3px; border-bottom:1px solid #2E4053; padding-bottom:6px; margin:30px 0 12px; scroll-margin-top:60px; }}
  h4 {{ margin:0 0 8px; font-size:13px; letter-spacing:.5px; }}
- .sub {{ display:flex; flex-wrap:wrap; gap:8px 22px; color:{MUTED}; font-size:14px; }}
- .sub b {{ color:{TXT}; font-weight:600; }}
- .muted {{ color:{MUTED}; font-size:13px; }}
+ /* sticky section bar */
+ nav.toc {{ position:sticky; top:0; z-index:20; background:{BG}; display:flex; gap:6px; overflow-x:auto;
+   padding:10px 0; margin:0 0 4px; border-bottom:1px solid #22364A; scrollbar-width:none; }}
+ nav.toc::-webkit-scrollbar {{ display:none; }}
+ nav.toc a {{ flex:0 0 auto; color:{TXT}; text-decoration:none; font-size:13px; padding:6px 12px; border-radius:16px;
+   background:{PANEL}; border:1px solid #2E4053; }}
+ nav.toc a:hover {{ border-color:{AMBER}; color:{AMBER}; }}
+ /* compact status strip */
+ .strip {{ display:flex; flex-wrap:wrap; gap:8px; margin:4px 0 6px; }}
+ .chip {{ background:{PANEL}; border-radius:8px; padding:6px 10px; font-size:13px; color:{MUTED}; }}
+ .chip b {{ color:{TXT}; font-weight:600; }} .chip b.g {{ color:{GRN}; }} .chip b.amber {{ color:{AMBER}; }} .chip b.r {{ color:{RD}; }}
+ .sub {{ color:{MUTED}; font-size:12px; margin:2px 0 0; }}
+ .muted {{ color:{MUTED}; font-size:13px; line-height:1.45; }}
  .banner {{ display:inline-block; padding:6px 12px; border-radius:6px; font-weight:700; font-size:13px; margin-bottom:6px; }}
  .banner.preview {{ background:#34495E; color:#fff; }} .banner.signal {{ background:{AMBER}; color:#2B1D02; }}
  .banner.executed {{ background:{GRN}; color:#0B2716; }}
  .banner.orderplan {{ background:{BLUE}; color:#0B1F2E; }} .banner.incomplete {{ background:{RD}; color:#fff; }}
  .marketopen {{ background:rgba(93,173,226,0.12); border:1px solid {BLUE}; border-radius:8px; padding:8px 14px; margin:12px 0; font-size:14px; }}
+ .marketopen.nolive {{ background:rgba(158,158,158,0.12); border-color:{GRAY}; }}
  .datawarn {{ background:rgba(231,76,60,0.12); border:1px solid {RD}; border-left:5px solid {RD};
    border-radius:8px; padding:10px 16px; margin:14px 0; font-size:14px; }}
  .datawarn p {{ margin:6px 0; }} .datawarn ul {{ margin:4px 0 6px; padding-left:22px; }}
  .datawarn.slim {{ padding:6px 12px; margin:6px 0; font-size:13px; }}
  .dw-title {{ color:{RD}; font-weight:700; letter-spacing:.5px; }}
- .dataok {{ color:{GRN}; font-size:13px; margin:12px 0 0; }}
+ .dataok {{ color:{GRN}; font-size:13px; margin:8px 0 0; }}
  td.stale {{ color:{AMBER}; font-weight:600; }}
  td.t6 {{ color:{BLUE}; font-weight:700; }}
  .note {{ background:#3B2F10; border:1px solid {AMBER}; border-radius:8px; padding:10px 14px; margin:14px 0; }}
  .kpis {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin:14px 0; }}
- .kpi {{ background:{PANEL}; border-radius:10px; padding:12px 16px; }}
+ .kpi {{ background:{PANEL}; border-radius:10px; padding:12px 16px; min-width:0; }}
  .kl {{ color:{MUTED}; font-size:12px; text-transform:uppercase; letter-spacing:.4px; }}
- .kv {{ font-size:24px; font-weight:600; margin-top:4px; font-variant-numeric:tabular-nums; }}
+ .kv {{ font-size:24px; font-weight:600; margin-top:4px; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }}
  .small .kv {{ font-size:18px; }}
  .k4 {{ grid-template-columns:repeat(4,1fr); }}
  @media (max-width:800px) {{ .k4 {{ grid-template-columns:repeat(2,1fr); }} }}
@@ -2552,24 +2616,49 @@ page_html = f"""<!DOCTYPE html>
  /* Fixed 2 columns: with auto-fit, a chart drawn before its row-mate exists is sized full-width and then clipped */
  .grid2 {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; }}
  @media (max-width:900px) {{ .grid2 {{ grid-template-columns:1fr; }} }}
- .tw {{ overflow:auto; max-height:640px; border-radius:10px; background:{PANEL}; }}
- table {{ border-collapse:collapse; width:100%; font-size:13px; font-variant-numeric:tabular-nums; }}
- th {{ background:#22364A; position:sticky; top:0; cursor:pointer; padding:8px; text-align:left; white-space:nowrap; z-index:1; }}
+ .tw {{ overflow:auto; max-height:640px; border-radius:10px; background:{PANEL}; -webkit-overflow-scrolling:touch; }}
+ table {{ border-collapse:separate; border-spacing:0; width:100%; font-size:13px; font-variant-numeric:tabular-nums; }}
+ th {{ background:#22364A; position:sticky; top:0; cursor:pointer; padding:8px; text-align:left; white-space:nowrap; z-index:2; }}
  th:hover {{ color:{AMBER}; }}
  td {{ padding:6px 8px; border-bottom:1px solid #22364A; white-space:nowrap; }}
- tr.pos td {{ background:rgba(46,204,113,0.10); }} tr.neg td {{ background:rgba(231,76,60,0.12); }}
- tr.warn td {{ background:rgba(245,166,35,0.14); }} tr.top td {{ background:rgba(93,173,226,0.08); }}
+ /* first column (Symbol) stays visible while a wide table scrolls sideways */
+ .tw td:first-child {{ position:sticky; left:0; z-index:1; background-color:{PANEL}; box-shadow:1px 0 0 #2E4053; }}
+ .tw th:first-child {{ position:sticky; left:0; z-index:3; box-shadow:1px 0 0 #2E4053; }}
+ /* row tints painted over an opaque panel colour, so the sticky first cell keeps the tint */
+ tr.pos td {{ background-image:linear-gradient(rgba(46,204,113,0.10),rgba(46,204,113,0.10)); background-color:{PANEL}; }}
+ tr.neg td {{ background-image:linear-gradient(rgba(231,76,60,0.12),rgba(231,76,60,0.12)); background-color:{PANEL}; }}
+ tr.warn td {{ background-image:linear-gradient(rgba(245,166,35,0.14),rgba(245,166,35,0.14)); background-color:{PANEL}; }}
+ tr.top td {{ background-image:linear-gradient(rgba(93,173,226,0.08),rgba(93,173,226,0.08)); background-color:{PANEL}; }}
+ .collapsed tr.more {{ display:none; }}
+ .morebtn {{ margin:8px 0 0; background:{PANEL}; color:{TXT}; border:1px solid #2E4053; border-radius:8px;
+   padding:8px 14px; font-size:13px; cursor:pointer; }}
+ .morebtn:hover {{ border-color:{AMBER}; color:{AMBER}; }}
  .badge {{ padding:2px 8px; border-radius:10px; font-size:11px; font-weight:700; letter-spacing:.3px; }}
  .b-buy {{ background:{GRN}; color:#0B2716; }} .b-hold {{ background:{BLUE}; color:#0B1F2E; }}
  .b-sell {{ background:{RD}; color:#fff; }} .b-risk {{ background:{AMBER}; color:#2B1D02; }}
  .b-skip {{ background:#7D6608; color:#fff; }} .b-out {{ background:#34495E; color:#D5DBDB; }}
- table.rules td {{ white-space:normal; overflow-wrap:anywhere; }}   /* long rule text wraps on phones */
+ table.rules td {{ white-space:normal; overflow-wrap:anywhere; vertical-align:top; }}   /* long rule text wraps on phones */
  table.rules td:first-child {{ color:{MUTED}; width:220px; }}
+ /* collapsible sections */
+ details.sec > summary {{ list-style:none; cursor:pointer; scroll-margin-top:60px; }}
+ details.sec > summary::-webkit-details-marker {{ display:none; }}
+ details.sec > summary h2 {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; }}
+ details.sec > summary h2::after {{ content:"▸ show"; font-size:12px; font-weight:400; color:{MUTED}; }}
+ details.sec[open] > summary h2::after {{ content:"▾ hide"; }}
+ details.sec > summary .muted {{ display:block; margin-bottom:10px; }}
  details.hist {{ margin-top:40px; background:#122130; border-radius:10px; padding:10px 16px; opacity:.9; }}
  details.hist summary {{ cursor:pointer; color:{MUTED}; font-weight:600; }}
- @media (max-width:600px) {{ body {{ padding:16px; }} .grid2 {{ grid-template-columns:1fr; }} .kv {{ font-size:20px; }} }}
+ .nojs {{ display:none; }}
+ @media (max-width:600px) {{
+   body {{ padding:0 12px 16px; }} h1 {{ font-size:19px; }} h2 {{ font-size:16px; margin-top:24px; }}
+   .kpis {{ gap:8px; grid-template-columns:repeat(2,minmax(0,1fr)); }} .kpi {{ padding:10px 12px; }}
+   .kv {{ font-size:19px; }} .small .kv {{ font-size:16px; }} .kl {{ font-size:11px; }}
+   .acts {{ grid-template-columns:1fr; gap:8px; }}
+   table {{ font-size:12px; }} td, th {{ padding:6px; }}
+   table.rules td:first-child {{ width:40%; }}
+ }}
 </style>
-<script type="text/javascript">{PLOTLY_JS}</script>
+{_plotly_tags}
 <script>
 function sortTable(id, col) {{
   var t = document.getElementById(id), tb = t.tBodies[0], rows = Array.from(tb.rows);
@@ -2589,73 +2678,100 @@ function resizeCharts() {{
     if (p.offsetWidth) Plotly.Plots.resize(p);
   }});
 }}
+// Phones / touch screens: charts must not capture the finger (page scrolls instead of zooming the
+// chart), and tall charts are made a little shorter. Tap still shows the values.
+function fitChartsForDevice() {{
+  if (!window.Plotly) return;
+  var small = window.matchMedia('(max-width:700px)').matches;
+  var touch = window.matchMedia('(pointer:coarse)').matches;
+  document.querySelectorAll('.js-plotly-plot').forEach(function(p) {{
+    var u = {{}}, isPie = p.data && p.data[0] && p.data[0].type === 'pie';
+    if (small || touch) {{ u.dragmode = false; if (!isPie) {{ u['xaxis.fixedrange'] = true; u['yaxis.fixedrange'] = true; }} }}
+    if (small && p.layout && p.layout.height > 320) {{
+      u.height = Math.max(300, Math.round(p.layout.height * 0.8));
+      p.style.height = u.height + 'px';            // the chart's own box keeps its old height otherwise
+    }}
+    if (Object.keys(u).length) Plotly.relayout(p, u);
+  }});
+}}
+function toggleMore(btn) {{
+  var w = btn.previousElementSibling, c = w.classList.toggle('collapsed');
+  btn.textContent = c ? btn.dataset.more : btn.dataset.less;
+}}
+window.addEventListener('load', function() {{
+  fitChartsForDevice(); resizeCharts();
+  if (!window.Plotly) document.querySelectorAll('.nojs').forEach(function(e) {{ e.style.display = 'block'; }});
+  // nav links open a collapsed section before jumping to it
+  document.querySelectorAll('nav.toc a').forEach(function(a) {{
+    a.addEventListener('click', function() {{
+      var t = document.getElementById(a.getAttribute('href').slice(1));
+      if (t && t.tagName === 'DETAILS') t.open = true;
+    }});
+  }});
+}});
 // Charts are drawn while the page is still loading; re-fit each one to its final box
-window.addEventListener('load', resizeCharts);
 document.addEventListener('toggle', resizeCharts, true);
 </script></head><body><div class="wrap">
 
 <h1>ETF Momentum Rotation — Live Portfolio Dashboard</h1>
-<div class="sub">
- <span>Live Start: <b>{live_start_label}</b></span>
- <span>Initial Capital: <b>{inr(INITIAL_CAPITAL)}</b></span>
- <span>Strategy: <b>ETF Momentum Rotation</b></span>
- <span>Universe: <b>C54</b></span>
- <span>Latest Market Data: <b>{AS_OF.date()}</b></span>
- <span>Next Entry Day: <b>{next_rebal.date()}{_exp(next_confirmed)}</b></span>
- <span>Status: <b>{signal_status}</b></span>
- <span>Data: <b class="{'g' if data_ok else 'amber'}">{'✓ Current' if data_ok else '⚠ Delayed'}</b></span>
- <span>Generated: <b>{now_ist():%Y-%m-%d %H:%M} IST</b></span>
+<div class="strip">
+ <span class="chip">Status <b class="{_status_cls}">{signal_status}</b></span>
+ <span class="chip">Next entry <b>{next_rebal.strftime("%a %d %b")}{_exp(next_confirmed)}</b></span>
+ <span class="chip">Data <b class="{'g' if data_ok else 'amber'}">{'✓' if data_ok else '⚠'} {AS_OF.strftime("%d %b %Y")}</b></span>
+ <span class="chip">Updated <b>{now_ist():%d %b %H:%M} IST</b></span>
 </div>
+<div class="sub">Live since {live_start_label} · Initial capital {inr(INITIAL_CAPITAL)} · Universe C54 ({len(SYMBOLS)} ETFs with data)</div>
+<nav class="toc">{nav_html}</nav>
 {market_html}
 {data_html}
 {state_note}
 <div class="kpis k4">{kpis_port}</div>
 
-<h2>Live Portfolio Actions</h2>
+<h2 id="actions">Live Portfolio Actions</h2>
 {actions_html}
 
-<h2>Current Live Positions</h2>
+<h2 id="positions">Current Live Positions</h2>
 <p class='muted'>Positions opened on or after {live_start_label} only. Rows: green = profit, red = loss,
-amber = exit risk (stop hit, outside top 6, or within {NEAR_STOP_PCT:.0f}% of a stop). Click a header to sort.</p>
+amber = exit risk (stop hit, outside top 6, or within {NEAR_STOP_PCT:.0f}% of a stop). Click a header to sort;
+swipe sideways for more columns.</p>
 {positions_html}
 
-<h2>My Account — real trades (Google Sheet)</h2>
+<h2 id="account">My Account — real trades (Google Sheet)</h2>
 {account_html}
 
-<h2>Risk Monitor</h2>
+<h2 id="risk">Risk Monitor</h2>
 <p class='muted'>Sorted by the position closest to an exit. Peak = highest entry-day close since entry (daily
 closes and today's price are not used) — the trailing level the strategy checks on the next entry day.</p>
 {risk_html}
 
-<h2>Current Strategy Signals</h2>
-<p class='muted'><b>{"PREVIEW — " if signal_status == "PENDING" else ""}</b>Full ranked universe from the
-{AS_OF.date()} close{" (not the final signal)" if signal_status == "PENDING" else ""}. Top {N_HOLD} are highlighted. Target allocation
-= current portfolio value / {N_HOLD} = {inr(target_now)}.</p>
-{signals_html}
+<h2 id="signals">Current Strategy Signals</h2>
+<p class='muted'><b>{"PREVIEW — " if signal_status == "PENDING" else ""}</b>Full ranked universe from
+{f"live prices {live_quote_time} IST (the {AS_OF.date()} close for ETFs without a live quote)" if LIVE_VIEW else f"the {AS_OF.date()} close"}{" (not the final signal)" if signal_status == "PENDING" else ""}.
+Top {N_HOLD} are highlighted. Target allocation = current portfolio value / {N_HOLD} = {inr(target_now)}.</p>
+<div class="collapsed">{signals_html}</div>
+<button class="morebtn" onclick="toggleMore(this)" data-more="Show all {len(sig_rows)} ETFs" data-less="Show top {SIG_SHOW} only">Show all {len(sig_rows)} ETFs</button>
 
-<h2>Ranking Trend</h2>
-<p class='muted'>Momentum rank on the last {len(trend_days)} entry days and now (top {N_HOLD} in blue). Change = rank
-movement since the last entry day (↑ = moved up). Shows the current top 15 plus anything you hold.</p>
-{rank_trend_html}
+{_sec("trend", "Ranking Trend", rank_trend_html,
+      f"Momentum rank now and on the last {len(trend_days)} entry days, newest first (top {N_HOLD} in blue). Change = "
+      f"rank movement since the last entry day (↑ = moved up). Current top 15 plus anything you hold.")}
 
-<h2>Live Performance</h2>
+<h2 id="perf">Live Performance</h2>
 <div class="kpis">{kpis_perf}</div>
 
-<h2>Next Rebalance</h2>
+<h2 id="next">Next Rebalance</h2>
 {next_html}
 
-<h2>Live Charts</h2>
+<h2 id="charts">Live Charts</h2>
+<p class="muted nojs">⚠ Charts could not be loaded (no internet connection to the chart library). All tables and
+figures above are complete.</p>
 {charts_html}
 
-<h2>Live Rebalance History</h2>
+<h2 id="history">Live Rebalance History</h2>
 {rebal_html}
 
-<h2>Live Closed Trades</h2>
-{live_trades_html}
-<div class="kpis small">{trade_stats_html}</div>
+{_sec("trades", f"Live Closed Trades ({n_lt})", live_trades_html + f'<div class="kpis small">{trade_stats_html}</div>')}
 
-<h2>Strategy Rules</h2>
-<table class="rules">{rules_html}</table>
+{_sec("rules", "Strategy Rules", f'<table class="rules">{rules_html}</table>')}
 
 {hist_html}
 </div></body></html>"""
@@ -2671,11 +2787,11 @@ print(f"  → {HTML_PATH}")
 # Public variant (GitHub Pages without PAGE_PASSWORD): the same page and summary WITHOUT the
 # My Account section — real account data is never published unencrypted.
 PUBLIC_HTML_PATH = OUTPUT_DIR / "ETF_Momentum_Test_1_Report_public.html"
-_acct_block = f"<h2>My Account — real trades (Google Sheet)</h2>\n{account_html}"
+_acct_block = f"<h2 id=\"account\">My Account — real trades (Google Sheet)</h2>\n{account_html}"
 if page_html.count(_acct_block) != 1:
     print("[HTML ERROR] could not isolate the My Account section for the public page")
     sys.exit(4)
-_public_html = page_html.replace(_acct_block, "<h2>My Account</h2>\n<p class='muted'>🔒 Hidden on the public "
+_public_html = page_html.replace(_acct_block, "<h2 id=\"account\">My Account</h2>\n<p class='muted'>🔒 Hidden on the public "
                                  "page. Add the PAGE_PASSWORD secret to publish the full, password-protected "
                                  "dashboard.</p>")
 try:
@@ -2724,6 +2840,7 @@ summary = {
     "market_hours": MARKET_HOURS,
     "live_quote_time": live_quote_time,
     "live_view": LIVE_VIEW,
+    "no_live_today": NO_LIVE_TODAY,               # market hours but Yahoo has no prices for today
     "order_plan_missing_quotes": order_plan_missing_quotes,
     "signal_source": signal_source,               # live / decision source of a recorded entry / latest close
     "signal_missing": signal_missing,             # ETFs without a live price (order plan)

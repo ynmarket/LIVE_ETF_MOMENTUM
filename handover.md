@@ -170,8 +170,11 @@ Categories are display labels only (MONQ50 = International, it is the Motilal Os
 17. **My Account** (§8): `read_trade_sheet()`, `parse_trades()`, `parse_cash()`, `_xirr()`,
     `_account_daily()`, `build_account()`, `perf_live`.
 18. **Excel** (`_write_excel()`, exit 3 on failure).
-19. **HTML** (Plotly JS embedded once in `<head>` as `PLOTLY_JS`; `fig_to_div()` never includes the
-    library), sections, then writes full HTML (exit 4) and the **public variant** without My Account.
+19. **HTML** (Plotly.js loaded once in `<head>` from cdnjs, jsdelivr as fallback, pinned to the Python
+    package's plotly.js version with an SRI hash computed from the bundled file — page ~0.25 MB instead of
+    ~5 MB; `fig_to_div()` never includes the library; without internet only the charts are missing),
+    sections, then writes full HTML (exit 4) and the **public variant** without My Account (the
+    `<h2 id="account">…` block is replaced — keep `_acct_block` in sync with the template).
 20. **summary.json** + **summary_public.json** (exit 5).
 
 Exit codes: 2 data, 3 Excel, 4 HTML, 5 summary (mapped to messages by the workflow).
@@ -292,6 +295,17 @@ Exit codes: 2 data, 3 Excel, 4 HTML, 5 summary (mapped to messages by the workfl
   execution-cost table) · Risk Monitor · Current Strategy Signals · **Ranking Trend** · Live
   Performance · Next Rebalance · Live Charts (allocation, P&L, value, drawdown, monthly returns) · Live
   Rebalance History · Live Closed Trades · Strategy Rules · collapsed Historical Backtest Reference.
+* **Dashboard UX (2026-10-09, display only)**: compact status chips + sticky section nav bar; important
+  table columns first (Symbol · Status · Price · P&L · stops …) with the first column sticky on sideways
+  scroll; Signals shows top 15 + "Show all"; Ranking Trend, Closed Trades and Rules are collapsible
+  (`<details class="sec">`, opened by the nav bar); charts: legend below, no drag-zoom on phones/touch
+  (`fitChartsForDevice()`: dragmode off, fixed axes, ~80 % height), horizontal P&L bars, value chart
+  without the cash line (cash in hover). Labels: "Market open" banner only with live prices (else "No
+  live prices today" — holiday/Yahoo not updated); Signals caption and Ranking "Now" say live when live;
+  Telegram exit-risk header says live; holiday entry day → "NO LIVE PRICES TODAY". Plan vs actual and
+  My holdings: same ETF/side within ±`MATCH_TOL_PCT` (5 %) of the plan value/qty = "MATCH (size …)"
+  (order plan sizes from live prices, record from the close) — reporting only.
+  `Hist_Open_Positions` peak/trail now use the stored engine peak. Workflow HTML check: > 150 KB + charts.
 * **Excel sheets**: Live_Summary, Live_Positions, Live_Actions, Live_Signals, Live_Data_Status,
   Rank_Trend, My_Account, My_Holdings, My_Plan_vs_Actual, My_Trades (backup copy of sheet rows),
   My_Performance, My_Execution_Cost, My_Cash, Live_Closed_Trades, Live_Equity, Live_Rebalances,
@@ -374,6 +388,7 @@ Exit codes: 2 data, 3 Excel, 4 HTML, 5 summary (mapped to messages by the workfl
     strategy trailing-stop display now shows the stored engine peak (no today's price).
 15. ~14:30 IST midday scheduled update (live prices, full SL detail; keeps a choice saved earlier that
     day); per-position SL lines in all summaries; reminder mentions the 14:30 fallback.
+16. Display fixes + mobile/desktop UX redesign, Plotly from CDN (page 5 MB → 0.25 MB); see §10.
 
 ## 14. What was tried and did NOT work / was reverted (don't repeat)
 
@@ -422,7 +437,7 @@ Exit codes: 2 data, 3 Excel, 4 HTML, 5 summary (mapped to messages by the workfl
   **A** liquidity check in the order plan (e.g. INTERNET shows zero volume), **B** ETF premium/discount
   vs NAV (AMFI), **C** price sanity check (±15% moves), **D** "enter your fills" follow-up reminder,
   **G** tax-ready FIFO capital-gains ledger, **I** copy-ready order list with limit prices, **J**
-  pre-entry-day preview, **L** monthly history cards, **N** lighter mobile page (~6.4 MB now),
+  pre-entry-day preview, **L** monthly history cards, ~~**N** lighter mobile page~~ (done 2026-10-09, ~0.25 MB),
   **O** backtest with real costs, **P** "run didn't happen" alert, **Q** weekly health message.
   Already done: K, E, F, H, M, R (+ real fills via Sheet, reminder, holiday fix, privacy, live view).
 * Data-source resilience (NSE bhavcopy / broker API + local price store) — user wants this later as a
