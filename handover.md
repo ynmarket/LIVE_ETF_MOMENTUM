@@ -204,7 +204,20 @@ Exit codes: 2 data, 3 Excel, 4 HTML, 5 summary (mapped to messages by the workfl
   (Google Cloud project `etf-momentum`, Sheets API enabled).
 * `Trades` row 1 headers (exact): `Trade Date | Symbol | Side | Quantity | Price | Charges ₹ | Entry Month
   | Order ID | Notes | Value ₹ (formula) | Net Cash ₹ (formula)`. One row per fill; Side BUY/SELL;
-  Entry Month optional (defaults to the trade date's month).
+  Entry Month optional (defaults to the trade date's month). **Side SPLIT** (added 2026-10-10): Trade Date =
+  split date, Quantity = new units per old unit (1:10 → 10), Price empty, Charges 0 — units × ratio, cost
+  unchanged (average ÷ ratio); earlier fills are converted for plan vs actual / execution cost.
+* **Splits / data checks (2026-10-10, reporting only)**: Yahoo prices are split-adjusted afterwards (it lists
+  no dividends for these ETFs; adjusted = raw close for all 54 — verified; ICICI ETFs split 1:10 in 2024).
+  The strategy record then shows the ETF in after-split units (values/stops stay right, tiny rounding).
+  Checks after My Account: `YAHOO_SPLITS` (from `fetch_close(..., split_out=)`, `actions=True` — Close
+  unchanged, proven) → "✂️ split reported" banner; `split_guide` → My Account box with the exact SPLIT row
+  to add (✓ once the row exists, matched within ±7 days); `price_changed` → saved entry-day closes
+  (`entry_decisions.json` → `closes`, written by CI once the entry day's closes are complete; reference
+  only, never used in calculations) differ from Yahoo now; `data_jumps` → |one-day move| > 40 % on held /
+  top-10 ETFs (also live) → "⛔ CHECK BEFORE TRADING" (likely a split Yahoo has not adjusted yet).
+  Telegram "✂️ Data check" (de-duplicated). Tested with simulated MONQ50 1:10 split (with/without row)
+  and an unadjusted −88 % jump.
 * `Cash` headers: `Date | Type | Amount ₹ | Notes`; Type = Deposit / Withdrawal / Dividend / Interest.
   Initial capital is recorded there as a Deposit.
 * The user's real fills and account figures are **private**: read them from the Google Sheet (local run

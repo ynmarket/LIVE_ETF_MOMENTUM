@@ -153,11 +153,14 @@ CATEGORY = dict(UNIVERSE)
 # ═════════════════════════════════════════════════════════════════════════════
 # DATA DOWNLOAD
 # ═════════════════════════════════════════════════════════════════════════════
-def fetch_close(yf_symbol, start, end, volume_out=None):
+def fetch_close(yf_symbol, start, end, volume_out=None, split_out=None):
     """Download daily Close for one symbol; returns a clean Series (may be empty).
-    volume_out (dict): if given, the symbol's daily Volume series is stored in it as well."""
+    volume_out (dict): if given, the symbol's daily Volume series is stored in it as well.
+    split_out (dict): if given, Yahoo's split events {date: ratio} are stored in it (reporting only —
+    Yahoo has already divided the earlier prices by the ratio; Close is identical with or without this)."""
     try:
-        df = yf.download(yf_symbol, start=start, end=end, progress=False, threads=False)
+        df = yf.download(yf_symbol, start=start, end=end, progress=False, threads=False,
+                         actions=split_out is not None)
     except Exception:
         return pd.Series(dtype=float)
     if df is None or df.empty:
@@ -180,6 +183,10 @@ def fetch_close(yf_symbol, start, end, volume_out=None):
         v = pd.to_numeric(v, errors="coerce").fillna(0)
         v.index = pd.to_datetime(v.index).tz_localize(None).normalize()
         volume_out[yf_symbol] = v[~v.index.duplicated(keep="last")].sort_index()
+    if split_out is not None and "Stock Splits" in df.columns:
+        sp = pd.to_numeric(df["Stock Splits"], errors="coerce").fillna(0)
+        sp.index = pd.to_datetime(sp.index).tz_localize(None).normalize()
+        split_out[yf_symbol] = {d: float(r) for d, r in sp[sp > 0].items()}
     return s
 
 
@@ -207,9 +214,9 @@ print(f"Downloading data for {len(UNIVERSE)} ETFs..."
 raw = {}
 dropped = []
 dropped_info = {}                       # symbol -> rows received (for the data-status report)
-_fetched, _volumes = {}, {}
+_fetched, _volumes, _splits = {}, {}, {}
 for nse, _cat in UNIVERSE:
-    s = fetch_close(f"{nse}.NS", dl_start, dl_end, volume_out=_volumes)
+    s = fetch_close(f"{nse}.NS", dl_start, dl_end, volume_out=_volumes, split_out=_splits)
     if MARKET_HOURS and not s.empty and s.index[-1] >= TODAY_TS:
         live_quotes[nse] = float(s.iloc[-1])
         s = s[s.index < TODAY_TS]
@@ -247,6 +254,8 @@ for nse, _cat in UNIVERSE:
         continue
     raw[nse] = s
 print(f"{len(raw)} ETFs loaded, {len(dropped)} dropped (insufficient history)")
+# Yahoo split events {symbol: {date: ratio}} — reporting only (Yahoo already adjusts earlier prices)
+YAHOO_SPLITS = {k[:-3]: v for k, v in _splits.items() if v}
 
 bm_raw = fetch_close(BM_SYMBOL, dl_start, dl_end)
 bm_live = None                          # Nifty 500 live value (market hours only)
@@ -1011,6 +1020,22 @@ if live_started:
             "saved": _stamp,
         }
         entry_notes.append(f"{month} decision from the {ed.date()} close")
+# 3) Reference only: the entry day's actual closes of every ETF traded or held that day, saved once the
+#    day's closes are complete. Never used in any calculation — only to detect when Yahoo later rewrites
+#    past prices (e.g. a split), see PRICE_CHANGED below.
+if live_started:
+    for m in live["monthly"]:
+        ed = m["rebal_date"]
+        month = ed.strftime("%Y-%m")
+        rec = _entries_new.get(month)
+        if not rec or rec.get("closes"):
+            continue
+        _syms = sorted({a["symbol"] for a in live["log"]
+                        if a["date"] == ed.date() and a["action"] in ("BUY", "SELL", "HOLD")})
+        if not _syms or missing_on(ed, _syms):
+            continue
+        rec["closes"] = {s: round(px(s, ed), 4) for s in _syms}
+        entry_notes.append(f"{month} entry-day closes (reference)")
 if entry_notes:
     if IN_CI:
         ENTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1313,12 +1338,16 @@ def parse_trades(t_rows):
             errs.append("Trade Date missing or not a date")
         if sym not in UNIVERSE_SYMBOLS:
             errs.append(f"unknown Symbol '{sym}'")
-        if side not in ("BUY", "SELL"):
-            errs.append(f"Side must be BUY or SELL (got '{side}')")
-        if qty is None or qty <= 0 or qty != int(qty):
-            errs.append("Quantity must be a positive whole number")
-        if price is None or price <= 0:
-            errs.append("Price must be a positive number")
+        if side not in ("BUY", "SELL", "SPLIT"):
+            errs.append(f"Side must be BUY, SELL or SPLIT (got '{side}')")
+        if side == "SPLIT":                     # Quantity = new units per old unit (1:10 split → 10)
+            if qty is None or qty <= 0:
+                errs.append("SPLIT: Quantity must be the split ratio — new units per old unit (e.g. 10)")
+        else:
+            if qty is None or qty <= 0 or qty != int(qty):
+                errs.append("Quantity must be a positive whole number")
+            if price is None or price <= 0:
+                errs.append("Price must be a positive number")
         if row.get(TRADE_COLS["charges"], "") not in ("", None) and (ch is None or ch < 0):
             errs.append("Charges must be a number ≥ 0")
         m_raw = row.get(TRADE_COLS["month"], "")
@@ -1331,8 +1360,10 @@ def parse_trades(t_rows):
         if errs:
             issues.append({"row": n, "problem": "; ".join(errs)})
             continue
-        good.append(dict(row=n, date=d, symbol=sym, side=side, qty=int(qty), price=price,
-                         charges=ch or 0.0, month=month,
+        good.append(dict(row=n, date=d, symbol=sym, side=side,
+                         qty=float(qty) if side == "SPLIT" else int(qty),
+                         price=0.0 if side == "SPLIT" else price,
+                         charges=(ch or 0.0) if side != "SPLIT" else 0.0, month=month,
                          order_id=str(row.get(TRADE_COLS["order_id"], "")).strip(),
                          notes=str(row.get(TRADE_COLS["notes"], "")).strip()))
     good.sort(key=lambda t: (t["date"], t["row"]))
@@ -1400,6 +1431,9 @@ def _account_daily(accepted, cash_moves, capital_assumed, start):
         held, tcash = {}, 0.0
         for t in accepted:
             if t["date"] <= d:
+                if t["side"] == "SPLIT":                 # units × ratio; no cash moves
+                    held[t["symbol"]] = round(held.get(t["symbol"], 0) * t["qty"])
+                    continue
                 held[t["symbol"]] = held.get(t["symbol"], 0) + (t["qty"] if t["side"] == "BUY" else -t["qty"])
                 tcash += (-(t["qty"] * t["price"] + t["charges"]) if t["side"] == "BUY"
                           else t["qty"] * t["price"] - t["charges"])
@@ -1431,6 +1465,14 @@ def build_account(trades, cash_moves, issues):
     for t in trades:
         h = held.setdefault(t["symbol"], {"qty": 0, "cost": 0.0, "pcost": 0.0, "since": None})
         charges += t["charges"]
+        if t["side"] == "SPLIT":                # units × ratio; cost unchanged → average price ÷ ratio
+            if not h["qty"]:
+                issues.append({"row": t["row"], "problem": f"SPLIT for {t['symbol']} but none held on "
+                                                          f"{t['date'].date()} — row ignored"})
+                ignored_rows.add(t["row"])
+            else:
+                h["qty"] = round(h["qty"] * t["qty"])
+            continue
         if t["side"] == "BUY":
             if h["qty"] == 0:
                 h["since"] = t["date"]          # first buy of the current holding
@@ -1475,7 +1517,7 @@ def build_account(trades, cash_moves, issues):
                        my_stop_status=("Hard SL hit" if price <= hard else "Trail hit" if price <= trail
                                        else "Near stop" if min(d_sl, d_tr) <= NEAR_STOP_PCT else "OK"),
                        my_price_stale=not (LIVE_VIEW and sym in live_quotes) and sym in stale)
-        holdings.append(dict(**ref,
+        holdings.append(dict(**ref, since=h["since"],
             symbol=sym, category=CATEGORY.get(sym, ""), qty=h["qty"], avg_cost=avg, invested=h["cost"],
             price=price, value=value,
             upnl=(value - h["cost"]) if value is not None and h["qty"] else None,
@@ -1500,6 +1542,17 @@ def build_account(trades, cash_moves, issues):
     acct_value_now = acct_value
     pnl = acct_value - capital
     # Plan vs actual for every recorded live entry day (strategy plan = recorded at that day's close)
+    # Yahoo divides prices before a split, so the plan (strategy closes) is in after-split units: your
+    # earlier fills are converted with your own SPLIT rows (units × ratio, price ÷ ratio) for comparison.
+    _my_splits = [t for t in trades if t["side"] == "SPLIT" and t["row"] not in ignored_rows]
+
+    def _split_factor(sym, d):
+        f = 1.0
+        for s in _my_splits:
+            if s["symbol"] == sym and s["date"] > d:
+                f *= s["qty"]
+        return f
+
     pva = []
     if live_started:
         for m in live["monthly"]:
@@ -1508,11 +1561,12 @@ def build_account(trades, cash_moves, issues):
                     if a["date"] == ed.date() and a["action"] in ("BUY", "SELL")}
             actual = {}
             for t in trades:
-                if t["month"] == month:
+                if t["month"] == month and t["side"] in ("BUY", "SELL") and t["row"] not in ignored_rows:
                     k = (t["symbol"], t["side"])
                     x = actual.setdefault(k, {"qty": 0, "value": 0.0, "charges": 0.0})
-                    x["qty"] += t["qty"]
-                    x["value"] += t["qty"] * t["price"]
+                    _f = _split_factor(t["symbol"], t["date"])
+                    x["qty"] += round(t["qty"] * _f)
+                    x["value"] += t["qty"] * t["price"]          # money is unchanged by a split
                     x["charges"] += t["charges"]
             for (sym, side) in sorted(set(plan) | set(actual), key=lambda k: (k[1], cur_rank.get(k[0], 999))):
                 p, a = plan.get((sym, side)), actual.get((sym, side))
@@ -1586,6 +1640,7 @@ def build_account(trades, cash_moves, issues):
         xirr=xirr, xirr_days=xirr_days, perf=perf, daily=daily, unpriced=sorted(unpriced),
         exec_months=exec_months, exec_total=cum if exec_months else None,
         holdings=holdings, pva=pva, latest_month=latest_month,
+        my_splits=[dict(symbol=s["symbol"], date=s["date"], ratio=s["qty"]) for s in _my_splits],
         latest_mismatches=sum(not r["status"].startswith("MATCH") for r in latest),
         latest_entered=any(r["actual_qty"] for r in latest),
         capital=capital, capital_assumed=capital_assumed, deposits=deposits, withdrawals=withdrawals,
@@ -1623,6 +1678,66 @@ elif account_error == "not configured":
     print("  [MY ACCOUNT] Google Sheet not configured — skipped")
 else:
     print(f"  [MY ACCOUNT] Could not read the Google Sheet: {account_error}")
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DATA CHECKS — splits and suspicious price jumps (reporting only; nothing is recalculated)
+# ═════════════════════════════════════════════════════════════════════════════
+# Yahoo divides an ETF's earlier prices after a split. The strategy record then simply shows the
+# ETF in after-split units (values and stops stay right), but YOUR sheet still has the old units until a
+# SPLIT row is added — the page shows the exact row. A huge one-day move usually means Yahoo has not
+# adjusted a split yet (or a data error): prices, stops and the order plan for that ETF are then wrong.
+JUMP_PCT = 40.0                     # |one-day move| above this = suspicious
+SPLIT_RECENT_DAYS = 120             # Yahoo split events shown on the page for this long
+
+
+def _ratio_txt(r):
+    return f"1:{r:g}" if r >= 1 else f"{1 / r:g}:1"
+
+
+_strat_held = set(live_state["positions"])
+_my_hold = {h["symbol"]: h for h in (account["holdings"] if account else []) if h["qty"]}
+_watch = sorted((_strat_held | set(_my_hold) | set(cur_ranked[:10])) & set(SYMBOLS))
+
+# a) Yahoo split events for ETFs held by the strategy or by you (recent ones), and the sheet row you need
+split_events, split_guide = [], []
+for sym in sorted(_strat_held | set(_my_hold)):
+    for d, r in sorted(YAHOO_SPLITS.get(sym, {}).items()):
+        if (TODAY - d).days <= SPLIT_RECENT_DAYS:
+            split_events.append(dict(symbol=sym, date=d.date(), ratio=r, ratio_txt=_ratio_txt(r),
+                                     strategy=sym in _strat_held, mine=sym in _my_hold))
+        h = _my_hold.get(sym)
+        if h and h.get("since") is not None and d > h["since"]:
+            done = any(s["symbol"] == sym and abs((s["date"] - d).days) <= 7 for s in account["my_splits"])
+            split_guide.append(dict(symbol=sym, date=d.date(), ratio=r, ratio_txt=_ratio_txt(r), done=done))
+
+# b) Yahoo rewrote past prices of a held ETF (saved entry-day close vs Yahoo's price for that day now)
+price_changed = []
+for month, rec in sorted(ENTRIES.items()):
+    ed = pd.Timestamp(rec.get("entry_date", "1900-01-01"))
+    for sym, c in (rec.get("closes") or {}).items():
+        if sym in _strat_held and sym in SYMBOLS and ed in etf_close.index and c:
+            now = px(sym, ed)
+            if abs(now / c - 1) > 0.005:
+                price_changed.append(dict(symbol=sym, date=ed.date(), saved=c, now=now, ratio=c / now))
+
+# c) Suspicious one-day moves (last 5 sessions, and today's live price vs the last close)
+data_jumps = []
+for sym in _watch:
+    s = raw[sym]
+    for d, ch in (s.pct_change().iloc[-5:] * 100).items():
+        if abs(ch) > JUMP_PCT:
+            data_jumps.append(dict(symbol=sym, when=str(d.date()), pct=float(ch)))
+    if LIVE_VIEW and sym in live_quotes:
+        ch = (live_quotes[sym] / float(s.iloc[-1]) - 1) * 100
+        if abs(ch) > JUMP_PCT:
+            data_jumps.append(dict(symbol=sym, when=f"live {live_quote_time}", pct=ch))
+for j in data_jumps:
+    print(f"  [DATA CHECK] {j['symbol']} moved {j['pct']:+.1f}% ({j['when']}) — possible split not yet "
+          f"adjusted by Yahoo, or a data error")
+for e in split_events:
+    print(f"  [SPLIT] Yahoo reports {e['symbol']} split {e['ratio_txt']} on {e['date']}")
+for p_ in price_changed:
+    print(f"  [PRICE CHANGED] {p_['symbol']} {p_['date']}: saved close {p_['saved']:.2f}, Yahoo now {p_['now']:.2f}")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # EXCEL OUTPUT — Live_* sheets first, historical reference as Hist_* sheets
@@ -1804,7 +1919,8 @@ if account is not None:
     my_xl["My_Trades"] = pd.DataFrame([{
         "Sheet Row": t["row"], "Trade Date": t["date"].date(), "Symbol": t["symbol"], "Side": t["side"],
         "Quantity": t["qty"], "Price": t["price"], "Charges": t["charges"], "Entry Month": t["month"],
-        "Order ID": t["order_id"], "Notes": t["notes"], "Value": t["qty"] * t["price"],
+        "Order ID": t["order_id"], "Notes": t["notes"],
+        "Value": t["qty"] * t["price"] if t["side"] != "SPLIT" else None,
     } for t in account_trades] + [{"Sheet Row": i["row"], "Notes": "PROBLEM: " + i["problem"]}
                                    for i in account_issues])
     my_xl["My_Performance"] = pd.DataFrame([{
@@ -2026,6 +2142,27 @@ if near_miss:
     data_html += ("<p class='muted'>Excluded for short Yahoo history, only a few rows below the "
                   f"{MIN_HISTORY}-row minimum (a delayed day can cause this): "
                   + ", ".join(f"{s} ({n}/{MIN_HISTORY})" for s, n in near_miss.items()) + "</p>")
+# ── Data-check banners (splits, rewritten prices, suspicious jumps) — public info only ──
+checks_html = ""
+if data_jumps:
+    checks_html += ("<div class='datawarn'><span class='dw-title'>⛔ CHECK BEFORE TRADING</span> — very large one-day "
+                    f"move (over {JUMP_PCT:.0f}%): " + "; ".join(f"<b>{j['symbol']}</b> {j['pct']:+.1f}% ({j['when']})"
+                                                                 for j in data_jumps)
+                    + ". Most likely a split that Yahoo has not adjusted yet, or a data error. Prices, P&amp;L, "
+                      "stops and the order plan for these ETFs may be wrong — check the price in your broker app.</div>")
+if split_events:
+    checks_html += ("<div class='marketopen'>✂️ <b>Split reported by Yahoo:</b> "
+                    + "; ".join(f"<b>{e['symbol']}</b> {e['ratio_txt']} on {e['date']}" for e in split_events)
+                    + ". Yahoo has converted all earlier prices to the new units, so the strategy record shows these "
+                      "ETFs in after-split units (values and stops stay correct)."
+                    + (" If you hold one of them, see <a href='#account' style='color:inherit'>My Account</a> for the "
+                       "row to add to your sheet." if account is not None else "") + "</div>")
+if price_changed:
+    checks_html += ("<div class='datawarn slim'>⚠ <b>Yahoo changed past prices</b> of held ETFs: "
+                    + "; ".join(f"{p_['symbol']} on {p_['date']}: saved close {num(p_['saved'])} → now "
+                                f"{num(p_['now'])} (×{p_['now'] / p_['saved']:.4g})" for p_ in price_changed)
+                    + ". Usually a split (see above); otherwise a Yahoo data correction — compare with your broker.</div>")
+
 act_data_warn = ("" if not (stale_actions or stale_signal or market_delayed) else
                  "<div class='datawarn slim'>⚠ Some prices behind these actions are delayed — "
                  "see the data warning at the top. Actions may change after the data catches up.</div>")
@@ -2094,7 +2231,29 @@ else:
                     + ("no trades entered yet." if not _a["latest_entered"] else
                        "✓ matches the strategy plan." if _a["latest_mismatches"] == 0 else
                        f"⚠ {_a['latest_mismatches']} difference(s) from the strategy plan."))
+    _todo = [g for g in split_guide if not g["done"]]
+    _split_html = ""
+    if _todo:
+        _rows = "".join(f"<tr><td>{g['date']}</td><td>{g['symbol']}</td><td>SPLIT</td><td><b>{g['ratio']:g}</b></td>"
+                        f"<td><i>leave empty</i></td><td>0</td><td>Split {g['ratio_txt']}</td></tr>" for g in _todo)
+        _split_html = f"""<div class='splitguide'>
+<div class='dw-title'>✂️ ACTION NEEDED — split detected for {", ".join(sorted({g['symbol'] for g in _todo}))}</div>
+<p>Yahoo reports a split for an ETF you hold, so its price is now quoted in new units, but your Google Sheet still
+has the old number of units. Until you add the row below, My Account shows a <b>wrong value, P&amp;L, stop status and
+execution cost</b> for it.</p>
+<p><b>Add this row to your Google Sheet → <u>Trades</u> tab</b> (one row per split):</p>
+<div class='tw'><table><thead><tr><th>Trade Date</th><th>Symbol</th><th>Side</th><th>Quantity</th><th>Price</th>
+<th>Charges ₹</th><th>Notes</th></tr></thead><tbody>{_rows}</tbody></table></div>
+<p class='muted'>Quantity = new units for each old unit (a 1:10 split → 10). Leave Price empty, Charges 0, Entry
+Month and Order ID empty. Check the ratio and date in your broker app first. On the next run your units,
+average price, P&amp;L, plan vs actual and reference stops are converted automatically; nothing else changes.</p>
+</div>"""
+    _split_done = [g for g in split_guide if g["done"]]
+    if _split_done:
+        _split_html += ("<p class='muted'>✓ Split recorded in your sheet: "
+                        + ", ".join(f"{g['symbol']} {g['ratio_txt']} ({g['date']})" for g in _split_done) + "</p>")
     account_html = f"""
+{_split_html}
 <p class='muted'>From your Google Sheet: {len(account_trades)} trade row(s), {len(account_cash)} cash row(s), read
 {now_ist():%Y-%m-%d %H:%M} IST. Prices = {f"live {live_quote_time} IST" if LIVE_VIEW else f"{AS_OF.date()} close"}; P&L after charges (average-cost method).{_cap_note}{_latest_note}</p>
 {_issues_html}
@@ -2661,6 +2820,9 @@ page_html = f"""<!DOCTYPE html>
  td.stale {{ color:{AMBER}; font-weight:600; }}
  td.t6 {{ color:{BLUE}; font-weight:700; }}
  .note {{ background:#3B2F10; border:1px solid {AMBER}; border-radius:8px; padding:10px 14px; margin:14px 0; }}
+ .splitguide {{ background:#3B2F10; border:1px solid {AMBER}; border-left:5px solid {AMBER}; border-radius:8px;
+   padding:10px 16px; margin:12px 0; font-size:14px; }}
+ .splitguide .dw-title {{ color:{AMBER}; }} .splitguide p {{ margin:6px 0; }}
  .kpis {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px; margin:14px 0; }}
  .kpi {{ background:{PANEL}; border-radius:10px; padding:12px 16px; min-width:0; }}
  .kl {{ color:{MUTED}; font-size:12px; text-transform:uppercase; letter-spacing:.4px; }}
@@ -2793,6 +2955,7 @@ document.addEventListener('toggle', resizeCharts, true);
 <nav class="toc">{nav_html}</nav>
 {market_html}
 {data_html}
+{checks_html}
 {state_note}
 <div class="kpis k4">{kpis_port}</div>
 
@@ -2910,6 +3073,10 @@ summary = {
     "live_quote_time": live_quote_time,
     "live_view": LIVE_VIEW,
     "no_live_today": NO_LIVE_TODAY,               # market hours but Yahoo has no prices for today
+    "splits": [{k: e[k] for k in ("symbol", "date", "ratio", "ratio_txt", "strategy")} for e in split_events],
+    "data_jumps": data_jumps,                     # |one-day move| > JUMP_PCT on held / top-10 ETFs
+    "price_changed": price_changed,               # Yahoo rewrote a saved entry-day close of a held ETF
+    "jump_pct": JUMP_PCT,
     "order_plan_missing_quotes": order_plan_missing_quotes,
     "signal_source": signal_source,               # live / decision source of a recorded entry / latest close
     "signal_missing": signal_missing,             # ETFs without a live price (order plan)
@@ -2940,6 +3107,7 @@ summary = {
         "xirr": account["xirr"], "xirr_days": account["xirr_days"], "xirr_min_days": XIRR_MIN_DAYS,
         "perf": account["perf"], "perf_live": account["perf_live"], "exec_total": account["exec_total"],
         "exec_latest": account["exec_months"][-1] if account["exec_months"] else None,
+        "split_guide": split_guide,               # rows to add to the sheet after a split (private)
         "holdings": [{k: h[k] for k in ("symbol", "qty", "avg_cost", "value", "upnl", "upnl_pct",
                                          "strategy_qty", "status", "price", "avg_fill", "my_peak",
                                          "my_hard_sl", "my_trail_sl", "my_dist_sl", "my_dist_trail",

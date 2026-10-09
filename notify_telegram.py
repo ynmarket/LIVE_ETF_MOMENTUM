@@ -7,6 +7,8 @@ Reads reports/summary.json (written by ETF_Momentum_Test_1.py) and sends:
   ✅ rebalance recorded                      (entry day's close, status EXECUTED)
   ⚠️ exit risk                               (stop hit, near a stop, or outside the top 6)
   👤 your account (reference)                (stop levels from your own fills hit / near — info only)
+  ✂️ data check                              (split reported, past prices changed, >40% one-day move;
+                                             with the exact SPLIT row to add to the Google Sheet)
   ⚠️ data delayed                            (held / top-6 / action ETFs without the latest price)
   📊 daily summary / 🕑 midday update         (evening, ~14:30 midday and manual runs; per-position
                                              strategy SL levels + your holdings with reference SL levels)
@@ -284,6 +286,42 @@ def msg_my_stops(s):
     return "\n".join(lines) + footer()
 
 
+def split_todo(s):
+    return [g for g in ((s.get("account") or {}).get("split_guide") or []) if not g.get("done")]
+
+
+def has_data_check(s):
+    return bool(s.get("data_jumps") or s.get("splits") or s.get("price_changed") or split_todo(s))
+
+
+def msg_data_check(s):
+    lines = ["✂️ <b>Data check — splits / price jumps</b>", ""]
+    for j in s.get("data_jumps") or []:
+        lines.append(f"⛔ <b>{esc(j['symbol'])}</b> moved {pct(j['pct'])} ({esc(j['when'])}) — possible split not yet "
+                     "adjusted by Yahoo, or a data error. <b>Check the price in your broker app before trading.</b>")
+    for e in s.get("splits") or []:
+        lines.append(f"✂️ Yahoo reports <b>{esc(e['symbol'])}</b> split {esc(e['ratio_txt'])} on {d(e['date'])} — "
+                     "earlier prices converted to new units.")
+    for p in s.get("price_changed") or []:
+        lines.append(f"⚠️ Yahoo changed the {d(p['date'])} price of {esc(p['symbol'])}: saved {num(p['saved'])} → "
+                     f"now {num(p['now'])}.")
+    todo = split_todo(s)
+    if todo:
+        lines += ["", "👤 <b>Add to your Google Sheet → Trades tab:</b>"]
+        for g in todo:
+            lines.append(f"• Trade Date <b>{g['date']}</b> · Symbol <b>{esc(g['symbol'])}</b> · Side <b>SPLIT</b> · "
+                         f"Quantity <b>{g['ratio']:g}</b> · Price empty · Charges 0")
+        lines.append("Until then My Account shows a wrong value for it. Details on the page.")
+    return "\n".join(lines) + footer()
+
+
+def key_data_check(s):
+    return (sorted((j["symbol"], j["when"]) for j in s.get("data_jumps") or []),
+            sorted((e["symbol"], e["date"]) for e in s.get("splits") or []),
+            sorted((p["symbol"], p["date"]) for p in s.get("price_changed") or []),
+            sorted((g["symbol"], g["date"]) for g in split_todo(s)))
+
+
 def data_affected(s):
     data = s["data"]
     signal_hit = data["stale_signal"] or data["stale_actions"]
@@ -361,6 +399,8 @@ def build_messages(s, prev, mode):
         msgs.append(msg_exit_risk(s))
     if my_stop_positions(s) and new(key_my_stops):
         msgs.append(msg_my_stops(s))
+    if has_data_check(s) and new(key_data_check):
+        msgs.append(msg_data_check(s))
     if data_affected(s) and new(key_data):
         msgs.append(msg_data(s))
     if mode in ("evening", "manual", "midday"):
