@@ -39,6 +39,14 @@
       "saved": {
         "at_ist": "2026-10-01 21:13",
         "run_id": "36886424422"
+      },
+      "closes": {
+        "MAFANG": 248.21,
+        "METALIETF": 12.61,
+        "MODEFENCE": 100.71,
+        "MON100": 321.46,
+        "MONQ50": 193.18,
+        "PHARMABEES": 27.11
       }
     }
   }
