@@ -51,7 +51,7 @@
     },
     "2026-11": {
       "entry_date": "2026-11-02",
-      "decided_from": "entry-day run, live prices 09:36 IST",
+      "decided_from": "entry-day run, live prices 14:35 IST",
       "top6": [
         "MONQ50",
         "MAFANG",
@@ -87,20 +87,20 @@
         "PHARMABEES"
       ],
       "scores": {
-        "MONQ50": 63.2195,
-        "MAFANG": 17.4858,
-        "PHARMABEES": 9.3031,
-        "ITBEES": 8.0176,
-        "PSUBNKBEES": 0.719,
-        "EBBETF0430": 0.6098,
-        "INTERNET": 0.4753,
+        "MONQ50": 62.915,
+        "MAFANG": 16.7074,
+        "PHARMABEES": 9.2639,
+        "ITBEES": 7.2452,
+        "PSUBNKBEES": 0.7407,
+        "EBBETF0430": 0.6451,
         "GILT5YBEES": 0.466,
-        "PVTBANIETF": -0.0822,
-        "LTGILTBEES": -0.4741
+        "INTERNET": 0.3241,
+        "LTGILTBEES": -0.508,
+        "PVTBANIETF": -0.8844
       },
       "saved": {
-        "at_ist": "2026-11-02 09:36",
-        "run_id": "41386544971"
+        "at_ist": "2026-11-02 14:35",
+        "run_id": "41417763275"
       }
     }
   }
