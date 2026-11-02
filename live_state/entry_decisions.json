@@ -101,6 +101,16 @@
       "saved": {
         "at_ist": "2026-11-02 15:18",
         "run_id": "41423590950"
+      },
+      "closes": {
+        "EBBETF0430": 1598.5699,
+        "ITBEES": 36.06,
+        "MAFANG": 218.83,
+        "METALIETF": 12.24,
+        "MODEFENCE": 96.58,
+        "MON100": 280.91,
+        "MONQ50": 213.8,
+        "PHARMABEES": 27.87
       }
     }
   }
