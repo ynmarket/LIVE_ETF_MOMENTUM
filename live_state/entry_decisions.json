@@ -48,6 +48,60 @@
         "MONQ50": 193.18,
         "PHARMABEES": 27.11
       }
+    },
+    "2026-11": {
+      "entry_date": "2026-11-02",
+      "decided_from": "entry-day run, live prices 09:36 IST",
+      "top6": [
+        "MONQ50",
+        "MAFANG",
+        "PHARMABEES",
+        "ITBEES",
+        "PSUBNKBEES",
+        "EBBETF0430"
+      ],
+      "buy": [
+        "ITBEES",
+        "EBBETF0430"
+      ],
+      "skip": [
+        "PSUBNKBEES"
+      ],
+      "sell": [
+        {
+          "symbol": "MON100",
+          "reason": "Rotation"
+        },
+        {
+          "symbol": "METALIETF",
+          "reason": "Rotation"
+        },
+        {
+          "symbol": "MODEFENCE",
+          "reason": "Rotation"
+        }
+      ],
+      "hold": [
+        "MONQ50",
+        "MAFANG",
+        "PHARMABEES"
+      ],
+      "scores": {
+        "MONQ50": 63.2195,
+        "MAFANG": 17.4858,
+        "PHARMABEES": 9.3031,
+        "ITBEES": 8.0176,
+        "PSUBNKBEES": 0.719,
+        "EBBETF0430": 0.6098,
+        "INTERNET": 0.4753,
+        "GILT5YBEES": 0.466,
+        "PVTBANIETF": -0.0822,
+        "LTGILTBEES": -0.4741
+      },
+      "saved": {
+        "at_ist": "2026-11-02 09:36",
+        "run_id": "41386544971"
+      }
     }
   }
 }
